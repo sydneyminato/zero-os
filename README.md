@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24355476.svg)](https://doi.org/10.5281/zenodo.24355476)
 ![ZERO OS M2 Live Demo](demo_preview.jpg)
 # ZERO OS: An Intent-Driven, Zero-Bloat Computational Architecture
 **純粋データと人間の意図をハードウェアへ直接マッピングする次世代極小OSアーキテクチャ**
