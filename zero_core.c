@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <ImageIO/ImageIO.h>
+#import <WebKit/WebKit.h>
 #if defined(__arm64__)
 #import <Virtualization/Virtualization.h>
 #endif
@@ -17,7 +18,7 @@
 
 #define FB_W 1280
 #define FB_H 800
-#define WIN_COUNT 4
+#define WIN_COUNT 5
 #define TERM_HIST 240
 #define TERM_MAX_COLS 120
 #define MAX_FILES 64
@@ -28,7 +29,8 @@ enum {
     WIN_LINUX = 0,
     WIN_MACOS = 1,
     WIN_FILES = 2,
-    WIN_AI_HUD = 3
+    WIN_AI_HUD = 3,
+    WIN_BROWSER = 4
 };
 
 typedef struct {
@@ -59,6 +61,7 @@ typedef struct {
     SpatialWindow wins[WIN_COUNT];
     int z_order[WIN_COUNT];
     char cwd[512];
+    char browser_url[512];
     char status_msg[256];
     char ai_reply[4096];
     int img_w;
@@ -71,7 +74,16 @@ static CGContextRef g_ctx = NULL;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static SpatialWindow g_wins[WIN_COUNT];
-static int g_z_order[WIN_COUNT] = { WIN_FILES, WIN_AI_HUD, WIN_MACOS, WIN_LINUX }; // last = frontmost
+static int g_z_order[WIN_COUNT] = { WIN_FILES, WIN_AI_HUD, WIN_MACOS, WIN_LINUX, WIN_BROWSER };
+
+// Native WebKit Spatial Stream state
+static WKWebView *g_webView = nil;
+static char g_browser_url[512] = "https://github.com/sydneyminato/zero-os";
+static char g_url_input[512] = "";
+static int g_url_input_mode = 0;
+static uint32_t *g_browser_snap = NULL;
+static int g_snap_w = 0, g_snap_h = 0;
+static int g_snap_tick = 0;
 
 // Host PTY shell state
 static int g_pty_fd = -1;
@@ -95,7 +107,7 @@ static int g_selected_file = 0;
 static uint32_t g_web_img[360 * 240];
 static int g_web_w = 0, g_web_h = 0;
 static int g_web_idx = 0;
-static char g_status[256] = "ZERO OS v0.4.0: SPATIAL MULTI-KERNEL WINDOW COMPOSITOR ONLINE";
+static char g_status[256] = "ZERO OS v0.5.0: SPATIAL MULTI-KERNEL + LIVE WEBKIT BROWSER STREAM";
 
 static char g_ai_reply[4096] = "Click AI box or press [F8], then [Cmd+V] to paste prompt.";
 static int g_ai_scroll = 0;
@@ -105,54 +117,66 @@ static char g_ai_prompt[512] = "";
 
 // --- Spatial Window Layout Initialization ---
 static void reset_spatial_layout(void) {
-    // 1. Guest Linux Kernel: Wide horizontal console (top-left)
+    // 1. Guest Linux Kernel: Top-left wide console
     g_wins[WIN_LINUX] = (SpatialWindow){
         .id = WIN_LINUX,
         .title = "GUEST LINUX KERNEL (ARM64 HYPERVISOR | /mnt/macos)",
-        .x = 24, .y = 24, .w = 660, .h = 400,
-        .min_w = 360, .min_h = 200,
+        .x = 20, .y = 20, .w = 560, .h = 360,
+        .min_w = 340, .min_h = 190,
         .border_col = 0xFF38BDF8,
         .title_bg   = 0xFF102A43,
         .body_bg    = 0xFF0B111A
     };
 
-    // 2. Host macOS Shell: Overlapping independent terminal (bottom-right-center)
+    // 2. Host macOS Shell: Bottom-center overlapping terminal
     g_wins[WIN_MACOS] = (SpatialWindow){
         .id = WIN_MACOS,
         .title = "HOST MACOS SHELL (POSIX /bin/zsh)",
-        .x = 590, .y = 360, .w = 656, .h = 392,
-        .min_w = 340, .min_h = 190,
+        .x = 460, .y = 420, .w = 500, .h = 340,
+        .min_w = 320, .min_h = 180,
         .border_col = 0xFF30F28C,
         .title_bg   = 0xFF123524,
         .body_bg    = 0xFF0C1410
     };
 
-    // 3. Host & VirtioFS Filesystem: Tall vertical browser (top-right)
+    // 3. Host & VirtioFS Filesystem: Compact right-side browser
     g_wins[WIN_FILES] = (SpatialWindow){
         .id = WIN_FILES,
-        .title = "FILESYSTEM & VIRTIOFS SHARED ([F2] Open | [F3] Shared)",
-        .x = 716, .y = 24, .w = 536, .h = 316,
-        .min_w = 320, .min_h = 180,
+        .title = "VIRTIOFS FILES ([O] Open | [F3] Shared)",
+        .x = 976, .y = 440, .w = 284, .h = 320,
+        .min_w = 250, .min_h = 180,
         .border_col = 0xFFF59E0B,
         .title_bg   = 0xFF33220A,
         .body_bg    = 0xFF12151E
     };
 
-    // 4. Local LLM & Hypervisor Telemetry HUD: Compact floating window (bottom-left)
+    // 4. Local LLM & Hypervisor Telemetry HUD: Bottom-left floating HUD
     g_wins[WIN_AI_HUD] = (SpatialWindow){
         .id = WIN_AI_HUD,
-        .title = "SPATIAL AI BRIDGE & TELEMETRY (127.0.0.1:11434)",
-        .x = 24, .y = 446, .w = 544, .h = 310,
-        .min_w = 360, .min_h = 220,
+        .title = "SPATIAL AI & TELEMETRY (127.0.0.1:11434)",
+        .x = 20, .y = 400, .w = 424, .h = 360,
+        .min_w = 320, .min_h = 210,
         .border_col = 0xFFA855F7,
         .title_bg   = 0xFF28153E,
         .body_bg    = 0xFF11131F
+    };
+
+    // 5. Native Spatial Web Browser (WebKit VSS Viewport): Top-right
+    g_wins[WIN_BROWSER] = (SpatialWindow){
+        .id = WIN_BROWSER,
+        .title = "SPATIAL WEB BROWSER (NATIVE WEBKIT STREAM)",
+        .x = 600, .y = 20, .w = 660, .h = 400,
+        .min_w = 360, .min_h = 240,
+        .border_col = 0xFFEC4899,
+        .title_bg   = 0xFF3B1228,
+        .body_bg    = 0xFF0F131D
     };
 
     g_z_order[0] = WIN_FILES;
     g_z_order[1] = WIN_AI_HUD;
     g_z_order[2] = WIN_MACOS;
     g_z_order[3] = WIN_LINUX;
+    g_z_order[4] = WIN_BROWSER;
 }
 
 static int front_window_id(void) {
@@ -169,6 +193,46 @@ static void bring_window_to_front(int win_id) {
         g_z_order[i] = g_z_order[i + 1];
     }
     g_z_order[WIN_COUNT - 1] = win_id;
+}
+
+static BOOL is_browser_occluded(void) {
+    int bpos = -1;
+    for (int i = 0; i < WIN_COUNT; i++) {
+        if (g_z_order[i] == WIN_BROWSER) { bpos = i; break; }
+    }
+    SpatialWindow *bw = &g_wins[WIN_BROWSER];
+    for (int i = bpos + 1; i < WIN_COUNT; i++) {
+        SpatialWindow *ow = &g_wins[g_z_order[i]];
+        BOOL overlapX = (bw->x < ow->x + ow->w) && (bw->x + bw->w > ow->x);
+        BOOL overlapY = (bw->y < ow->y + ow->h) && (bw->y + bw->h > ow->y);
+        if (overlapX && overlapY) return YES;
+    }
+    return NO;
+}
+
+static void navigate_browser_to(const char *raw_url) {
+    if (!raw_url || !raw_url[0]) return;
+    char full[512];
+    if (strstr(raw_url, "://") != NULL) {
+        snprintf(full, sizeof(full), "%s", raw_url);
+    } else if (strchr(raw_url, '.') != NULL && strchr(raw_url, ' ') == NULL) {
+        snprintf(full, sizeof(full), "https://%s", raw_url);
+    } else {
+        NSString *q = [[NSString stringWithUTF8String:raw_url] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+        snprintf(full, sizeof(full), "https://duckduckgo.com/?q=%s", [q UTF8String]);
+    }
+    strncpy(g_browser_url, full, sizeof(g_browser_url) - 1);
+    g_browser_url[sizeof(g_browser_url) - 1] = '\0';
+    NSString *nsUrl = [NSString stringWithUTF8String:g_browser_url];
+    if (nsUrl && g_webView) {
+        NSURL *u = [NSURL URLWithString:nsUrl];
+        if (u) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [g_webView loadRequest:[NSURLRequest requestWithURL:u]];
+            });
+            snprintf(g_status, sizeof(g_status), "LOADING WEB STREAM: %s", g_browser_url);
+        }
+    }
 }
 
 // --- 44.1 kHz Direct PCM Chime Synthesizer ---
@@ -399,7 +463,6 @@ static void boot_native_linux_kernel(void) {
     }
 
     g_vz_vm = [[VZVirtualMachine alloc] initWithConfiguration:cfg];
-    bring_window_to_front(WIN_LINUX);
     snprintf(g_status, sizeof(g_status), "BOOTING ARM64 LINUX KERNEL + VIRTIOFS IN SPATIAL WINDOW...");
 
     [g_vz_vm startWithCompletionHandler:^(NSError *err) {
@@ -409,7 +472,7 @@ static void boot_native_linux_kernel(void) {
             snprintf(g_status, sizeof(g_status), "VM START ERROR: %s", [[err localizedDescription] UTF8String]);
         } else {
             g_vm_running = 1;
-            snprintf(g_status, sizeof(g_status), "SPATIAL MULTI-KERNEL ACTIVE: LINUX + MACOS + VIRTIOFS COEXISTING");
+            snprintf(g_status, sizeof(g_status), "ZERO OS v0.5.0: LINUX + MACOS + VIRTIOFS + LIVE WEBKIT ACTIVE");
             play_pcm_chime();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 const char *welcome = "/bin/busybox --install -s 2>/dev/null; export PATH=/bin:/sbin:/usr/bin:/usr/sbin; mkdir -p /mnt/macos && mount -t virtiofs zero_share /mnt/macos && ls -la /mnt/macos\n";
@@ -432,15 +495,9 @@ static void fetch_live_web_image(void) {
     };
     NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:urls[g_web_idx % 3]]];
     g_web_idx++;
-    snprintf(g_status, sizeof(g_status), "FETCHING LIVE WEB ASSET VIA NSURLSESSION...");
 
     [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (err || !data) {
-            pthread_mutex_lock(&g_lock);
-            snprintf(g_status, sizeof(g_status), "NET FETCH ERROR (OFFLINE OR BLOCKED)");
-            pthread_mutex_unlock(&g_lock);
-            return;
-        }
+        if (err || !data) return;
         CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
         if (!src) return;
         CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
@@ -460,7 +517,6 @@ static void fetch_live_web_image(void) {
         memcpy(g_web_img, tmp, sizeof(tmp));
         g_web_w = w;
         g_web_h = h;
-        snprintf(g_status, sizeof(g_status), "DECODED LIVE JPEG (%lu BYTES) INTO SPATIAL HUD", (unsigned long)data.length);
         pthread_mutex_unlock(&g_lock);
     }] resume];
 }
@@ -499,13 +555,14 @@ static void query_local_ai_native(const char *prompt) {
     }] resume];
 }
 
-// --- .atom Binary State Crystallization (Includes Window Positions & Z-Order) ---
+// --- .atom Binary State Crystallization (Includes Window Positions, Z-Order & Browser URL) ---
 static void save_atom_snapshot(void) {
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    snap->magic = 0x5A455241;
+    snap->magic = 0x5A455242;
     memcpy(snap->wins, g_wins, sizeof(g_wins));
     memcpy(snap->z_order, g_z_order, sizeof(g_z_order));
     strncpy(snap->cwd, g_cwd, sizeof(snap->cwd) - 1);
+    strncpy(snap->browser_url, g_browser_url, sizeof(snap->browser_url) - 1);
     strncpy(snap->status_msg, g_status, sizeof(snap->status_msg) - 1);
     strncpy(snap->ai_reply, g_ai_reply, sizeof(snap->ai_reply) - 1);
     snap->img_w = g_web_w;
@@ -517,7 +574,7 @@ static void save_atom_snapshot(void) {
     if (f) {
         fwrite(snap, sizeof(ZeroAtomSnapshot), 1, f);
         fclose(f);
-        snprintf(g_status, sizeof(g_status), "CRYSTALLIZED SPATIAL LAYOUT + STATE -> state.atom (%lu KB)", sizeof(ZeroAtomSnapshot) / 1024);
+        snprintf(g_status, sizeof(g_status), "CRYSTALLIZED 5-WINDOW SPATIAL STATE -> state.atom (%lu KB)", sizeof(ZeroAtomSnapshot) / 1024);
         play_pcm_chime();
     }
     free(snap);
@@ -531,19 +588,20 @@ static void restore_atom_snapshot(void) {
         return;
     }
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455241) {
+    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455242) {
         memcpy(g_wins, snap->wins, sizeof(g_wins));
         memcpy(g_z_order, snap->z_order, sizeof(g_z_order));
         scan_directory(snap->cwd);
+        navigate_browser_to(snap->browser_url);
         strncpy(g_ai_reply, snap->ai_reply, sizeof(g_ai_reply) - 1);
         g_ai_scroll = 0;
         g_web_w = snap->img_w;
         g_web_h = snap->img_h;
         memcpy(g_web_img, snap->img_buf, sizeof(g_web_img));
-        snprintf(g_status, sizeof(g_status), "INSTANTLY RESTORED SPATIAL WINDOWS & STATE IN <1 MS");
+        snprintf(g_status, sizeof(g_status), "INSTANTLY RESTORED 5-WINDOW SPATIAL STATE IN <1 MS");
         play_pcm_chime();
     } else {
-        snprintf(g_status, sizeof(g_status), "OLD .ATOM FORMAT DETECTED — PRESS [F6] TO SAVE v0.4.0 STATE");
+        snprintf(g_status, sizeof(g_status), "PREVIOUS .ATOM FORMAT — PRESS [F6] TO SAVE v0.5.0 STATE");
     }
     fclose(f);
     free(snap);
@@ -631,14 +689,12 @@ static void render_terminal_window(SpatialWindow *w, TermBuffer *tb, BOOL is_fro
         }
     }
 
-    // [COPY] button in title bar
     int cbx = w->x + w->w - 64;
     int cby = w->y + 5;
     fill_rect(cbx, cby, 54, 18, 0xFF0F172A);
     draw_border(cbx, cby, 54, 18, w->border_col, 1);
     draw_text(cbx + 7, cby + 2, "[COPY]", 10.5, accent, YES);
 
-    // Scrollbar track & thumb on right edge
     int tx = w->x + w->w - 14;
     int ty = w->y + 34;
     int tw = 8;
@@ -654,43 +710,42 @@ static void render_terminal_window(SpatialWindow *w, TermBuffer *tb, BOOL is_fro
 
 static void render_files_window(SpatialWindow *w, NSColor *cCyan, NSColor *cAmber, NSColor *cWhite, NSColor *cDim) {
     char cwd_disp[128];
-    int max_path_chars = MAX(20, (w->w - 30) / 7);
+    int max_path_chars = MAX(14, (w->w - 24) / 7);
     snprintf(cwd_disp, sizeof(cwd_disp), "PATH: %.*s", max_path_chars, g_cwd);
-    draw_text(w->x + 12, w->y + 34, cwd_disp, 11, cDim, NO);
+    draw_text(w->x + 10, w->y + 34, cwd_disp, 10.5, cDim, NO);
 
-    int list_y = w->y + 54;
-    int list_h = MAX(40, w->h - 66);
+    int list_y = w->y + 52;
+    int list_h = MAX(40, w->h - 64);
     int max_vis = MAX(2, list_h / 19);
     int start_idx = (g_selected_file >= max_vis) ? (g_selected_file - max_vis + 1) : 0;
-    int name_cols = MAX(14, (w->w - 160) / 7);
+    int name_cols = MAX(10, (w->w - 118) / 7);
 
     for (int i = 0; i < max_vis && (start_idx + i) < g_file_count; i++) {
         int idx = start_idx + i;
         int ry = list_y + i * 19;
-        if (idx == g_selected_file) fill_rect(w->x + 8, ry - 2, w->w - 18, 18, 0xFF26334D);
+        if (idx == g_selected_file) fill_rect(w->x + 6, ry - 2, w->w - 14, 18, 0xFF26334D);
         char line[160];
         if (g_files[idx].is_dir) {
-            snprintf(line, sizeof(line), "[DIR]  %-*.*s <DIR>", name_cols, name_cols, g_files[idx].name);
-            draw_text(w->x + 14, ry, line, 11.5, cAmber, idx == g_selected_file);
+            snprintf(line, sizeof(line), "[D] %-*.*s <DIR>", name_cols, name_cols, g_files[idx].name);
+            draw_text(w->x + 10, ry, line, 11, cAmber, idx == g_selected_file);
         } else {
-            snprintf(line, sizeof(line), "[FILE] %-*.*s %7lld B", name_cols, name_cols, g_files[idx].name, g_files[idx].size);
-            draw_text(w->x + 14, ry, line, 11.5, cWhite, idx == g_selected_file);
+            snprintf(line, sizeof(line), "[F] %-*.*s %6lldB", name_cols, name_cols, g_files[idx].name, g_files[idx].size);
+            draw_text(w->x + 10, ry, line, 11, cWhite, idx == g_selected_file);
         }
     }
 }
 
 static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGreen, NSColor *cAmber, NSColor *cWhite, NSColor *cDim) {
     char info1[96], info2[96];
-    snprintf(info1, sizeof(info1), "MACH RAM: %.2f MB | LINUX VM: %s",
-             get_mach_ram_mb(), g_vm_running ? "LIVE (2 vCPU, 256MB)" : "STANDBY");
+    snprintf(info1, sizeof(info1), "MACH RAM: %.2f MB | VM: %s",
+             get_mach_ram_mb(), g_vm_running ? "LIVE (256MB)" : "STANDBY");
     snprintf(info2, sizeof(info2), "VIRTIOFS: ~/zero_os/shared <-> /mnt/macos");
-    draw_text(w->x + 12, w->y + 34, info1, 11.5, cGreen, YES);
-    draw_text(w->x + 12, w->y + 52, info2, 11.0, cAmber, NO);
+    draw_text(w->x + 12, w->y + 34, info1, 11.0, cGreen, YES);
+    draw_text(w->x + 12, w->y + 52, info2, 10.5, cAmber, NO);
 
-    // Optional compact live web thumbnail on top-right if wide enough
-    if (g_web_w > 0 && g_web_h > 0 && w->w >= 480) {
-        int tw = 108, th = 72;
-        int tx = w->x + w->w - tw - 14;
+    if (g_web_w > 0 && g_web_h > 0 && w->w >= 400) {
+        int tw = 96, th = 64;
+        int tx = w->x + w->w - tw - 12;
         int ty = w->y + 34;
         for (int j = 0; j < th; j++) {
             int sy = (j * g_web_h) / th;
@@ -705,26 +760,25 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
         draw_border(tx - 1, ty - 1, tw + 2, th + 2, 0xFF38BDF8, 1);
     }
 
-    // AI Prompt/Reply Box
     int bx = w->x + 12;
-    int by = w->y + 114;
-    int bw = MAX(200, w->w - 24);
-    int bh = MAX(90, w->h - 128);
+    int by = w->y + 108;
+    int bw = MAX(180, w->w - 24);
+    int bh = MAX(80, w->h - 124);
     fill_rect(bx, by, bw, bh, 0xFF080A10);
     draw_border(bx, by, bw, bh, g_ai_input_mode ? 0xFFF59E0B : 0xFF3B4254, 1);
-    draw_text(bx + 10, by + 6, "LOCAL LLM (127.0.0.1:11434) — [F8] Ask | [Cmd+C] Copy", 11, cCyan, YES);
+    draw_text(bx + 8, by + 6, "LOCAL LLM (127.0.0.1:11434) — [F8] Ask", 10.5, cCyan, YES);
 
     if (g_ai_input_mode) {
-        int pcols = MAX(18, (bw - 24) / 7);
+        int pcols = MAX(14, (bw - 20) / 7);
         size_t plen = strlen(g_ai_prompt);
         const char *tail = (plen > (size_t)pcols) ? (g_ai_prompt + plen - pcols) : g_ai_prompt;
         char pbuf[220];
         snprintf(pbuf, sizeof(pbuf), "PROMPT> %s_", tail);
-        draw_text(bx + 10, by + 30, pbuf, 11.5, cAmber, YES);
-        draw_text(bx + 10, by + bh - 20, "[Cmd+V] Paste | [Enter] Send | [Esc] Cancel", 10.5, cDim, NO);
+        draw_text(bx + 8, by + 30, pbuf, 11, cAmber, YES);
+        draw_text(bx + 8, by + bh - 20, "[Cmd+V] Paste | [Enter] Send | [Esc] Cancel", 10, cDim, NO);
     } else {
-        int cols = MAX(20, (bw - 34) / 7);
-        int vis_rows = MAX(2, (bh - 46) / 16);
+        int cols = MAX(16, (bw - 30) / 7);
+        int vis_rows = MAX(2, (bh - 44) / 16);
         char lines[AI_MAX_LINES][AI_MAX_COLS + 1];
         g_ai_total_lines = wrap_ai_lines(g_ai_reply, cols, lines);
         int max_scroll = MAX(0, g_ai_total_lines - vis_rows);
@@ -734,15 +788,14 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
         for (int r = 0; r < vis_rows; r++) {
             int lidx = g_ai_scroll + r;
             if (lidx < g_ai_total_lines && lines[lidx][0]) {
-                draw_text(bx + 10, by + 26 + r * 16, lines[lidx], 11.5, cWhite, NO);
+                draw_text(bx + 8, by + 25 + r * 16, lines[lidx], 11, cWhite, NO);
             }
         }
 
-        // Scrollbar inside AI box
-        int tx = bx + bw - 14;
-        int ty = by + 25;
-        int tw = 8;
-        int th = MAX(16, bh - 44);
+        int tx = bx + bw - 12;
+        int ty = by + 24;
+        int tw = 7;
+        int th = MAX(16, bh - 42);
         fill_rect(tx, ty, tw, th, 0xFF1E293B);
         int thumb_h = (g_ai_total_lines <= vis_rows) ? th : MAX(12, (th * vis_rows) / g_ai_total_lines);
         int thumb_y = ty;
@@ -751,33 +804,84 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
         }
         fill_rect(tx, thumb_y, tw, thumb_h, 0xFFA855F7);
 
-        char hint[96];
-        snprintf(hint, sizeof(hint), "Line %d/%d | Drag title to move window, corner to resize",
+        char hint[80];
+        snprintf(hint, sizeof(hint), "[Cmd+C] Copy | Line %d/%d",
                  MIN(g_ai_scroll + vis_rows, g_ai_total_lines), g_ai_total_lines);
-        draw_text(bx + 10, by + bh - 18, hint, 10, cDim, NO);
+        draw_text(bx + 8, by + bh - 17, hint, 10, cDim, NO);
     }
+}
+
+static void render_browser_window(SpatialWindow *w, BOOL is_front, NSColor *cPink, NSColor *cAmber, NSColor *cWhite, NSColor *cDim) {
+    // Navigation buttons [<] [R] and URL bar at y + 32 .. y + 54
+    int bar_y = w->y + 32;
+    fill_rect(w->x + 10, bar_y, 26, 20, 0xFF1E293B);
+    draw_border(w->x + 10, bar_y, 26, 20, 0xFFEC4899, 1);
+    draw_text(w->x + 16, bar_y + 3, "<", 11, cWhite, YES);
+
+    fill_rect(w->x + 40, bar_y, 26, 20, 0xFF1E293B);
+    draw_border(w->x + 40, bar_y, 26, 20, 0xFFEC4899, 1);
+    draw_text(w->x + 48, bar_y + 3, "R", 11, cWhite, YES);
+
+    int ux = w->x + 72;
+    int uw = MAX(100, w->w - 84);
+    fill_rect(ux, bar_y, uw, 20, 0xFF07090F);
+    draw_border(ux, bar_y, uw, 20, g_url_input_mode ? 0xFFF59E0B : 0xFF475569, 1);
+
+    int max_url_chars = MAX(14, (uw - 12) / 7);
+    if (g_url_input_mode) {
+        size_t len = strlen(g_url_input);
+        const char *tail = (len > (size_t)max_url_chars) ? (g_url_input + len - max_url_chars) : g_url_input;
+        char udisp[256];
+        snprintf(udisp, sizeof(udisp), "%s_", tail);
+        draw_text(ux + 6, bar_y + 3, udisp, 11, cAmber, YES);
+    } else {
+        char udisp[256];
+        snprintf(udisp, sizeof(udisp), "%.*s", max_url_chars, g_browser_url);
+        draw_text(ux + 6, bar_y + 3, udisp, 11, cWhite, NO);
+    }
+
+    // Content Viewport Area (y + 56 to y + h - 18)
+    int vx = w->x + 4;
+    int vy = w->y + 56;
+    int vw = w->w - 8;
+    int vh = w->h - 74;
+
+    if (g_browser_snap && g_snap_w > 0 && g_snap_h > 0 && vw > 0 && vh > 0) {
+        for (int j = 0; j < vh; j++) {
+            int dy = vy + j;
+            if (dy < 0 || dy >= FB_H) continue;
+            int sy = (j * g_snap_h) / vh;
+            for (int i = 0; i < vw; i++) {
+                int dx = vx + i;
+                if (dx < 0 || dx >= FB_W) continue;
+                int sx = (i * g_snap_w) / vw;
+                g_fb[dy * FB_W + dx] = g_browser_snap[sy * g_snap_w + sx];
+            }
+        }
+    } else {
+        fill_rect(vx, vy, vw, vh, 0xFF141926);
+        draw_text(vx + 16, vy + 20, "Loading Native WebKit Viewport...", 12, cDim, NO);
+    }
+
+    draw_text(w->x + 12, w->y + w->h - 16, "[F2] Edit URL | [Cmd+V] Paste URL | Click Browser to Interact", 10, cDim, NO);
 }
 
 static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
     NSColor *cCyan  = [NSColor colorWithRed:0.25 green:0.90 blue:0.95 alpha:1.0];
     NSColor *cGreen = [NSColor colorWithRed:0.30 green:0.95 blue:0.55 alpha:1.0];
     NSColor *cAmber = [NSColor colorWithRed:1.00 green:0.78 blue:0.25 alpha:1.0];
+    NSColor *cPink  = [NSColor colorWithRed:0.95 green:0.35 blue:0.65 alpha:1.0];
     NSColor *cWhite = [NSColor colorWithWhite:0.92 alpha:1.0];
     NSColor *cDim   = [NSColor colorWithWhite:0.58 alpha:1.0];
 
-    // Drop shadow for spatial depth
     fill_rect(w->x + 6, w->y + 6, w->w, w->h, 0xFF04060A);
-
-    // Window body & title bar
     fill_rect(w->x, w->y, w->w, w->h, w->body_bg);
     fill_rect(w->x, w->y, w->w, 28, is_front ? w->title_bg : 0xFF161B26);
     draw_border(w->x, w->y, w->w, w->h, is_front ? w->border_col : 0xFF334155, is_front ? 2 : 1);
 
-    // Clip all window interior drawing strictly inside the window bounds
     CGContextSaveGState(g_ctx);
     CGContextClipToRect(g_ctx, CGRectMake(w->x + 2, w->y + 2, w->w - 4, w->h - 4));
 
-    // Active indicator dot + Title
     fill_rect(w->x + 10, w->y + 10, 8, 8, is_front ? w->border_col : 0xFF475569);
     draw_text(w->x + 24, w->y + 6, w->title, 11.5, is_front ? cWhite : cDim, is_front);
 
@@ -789,9 +893,10 @@ static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
         render_files_window(w, cCyan, cAmber, cWhite, cDim);
     } else if (w->id == WIN_AI_HUD) {
         render_ai_hud_window(w, cCyan, cGreen, cAmber, cWhite, cDim);
+    } else if (w->id == WIN_BROWSER) {
+        render_browser_window(w, is_front, cPink, cAmber, cWhite, cDim);
     }
 
-    // Bottom-right resize grip triangle
     int gx = w->x + w->w - 14;
     int gy = w->y + w->h - 14;
     for (int k = 0; k < 10; k += 3) {
@@ -804,7 +909,6 @@ static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
 static void render_frame(void) {
     pthread_mutex_lock(&g_lock);
 
-    // Spatial dark canvas background with subtle grid dots
     fill_rect(0, 0, FB_W, FB_H, 0xFF070A10);
     for (int gy = 24; gy < FB_H - 24; gy += 32) {
         for (int gx = 24; gx < FB_W; gx += 32) {
@@ -816,27 +920,25 @@ static void render_frame(void) {
     NSGraphicsContext *nsCtx = [NSGraphicsContext graphicsContextWithCGContext:g_ctx flipped:YES];
     [NSGraphicsContext setCurrentContext:nsCtx];
 
-    // Render all spatial windows from back to front (Z-order)
     for (int i = 0; i < WIN_COUNT; i++) {
         int wid = g_z_order[i];
         BOOL is_front = (i == WIN_COUNT - 1);
         render_spatial_window(&g_wins[wid], is_front);
     }
 
-    // Bottom Spatial Dock / Status Bar
     NSColor *cGreen = [NSColor colorWithRed:0.30 green:0.95 blue:0.55 alpha:1.0];
     NSColor *cCyan  = [NSColor colorWithRed:0.25 green:0.90 blue:0.95 alpha:1.0];
     fill_rect(0, FB_H - 24, FB_W, 24, 0xFF0F172A);
     fill_rect(0, FB_H - 24, FB_W, 1, 0xFF1E293B);
     draw_text(14, FB_H - 20, g_status, 11, cGreen, YES);
-    draw_text(740, FB_H - 20, "[F1] Next Win | [F3] Shared | [F6/F7] .atom | [F10] Reset Layout", 10.5, cCyan, NO);
+    draw_text(740, FB_H - 20, "[F1] Cycle Win | [F2] URL | [F3] Shared | [F6/F7] .atom | [F10] Reset", 10.5, cCyan, NO);
 
     [NSGraphicsContext setCurrentContext:prevCtx];
     pthread_mutex_unlock(&g_lock);
 }
 
-@interface ZeroView : NSView {
-    int _dragMode; // 0=none, 1=move window, 2=resize window, 3=AI scroll, 4=Term scroll
+@interface ZeroView : NSView <WKNavigationDelegate> {
+    int _dragMode; // 0=none, 1=move, 2=resize, 3=AI scroll, 4=Term scroll
     int _dragWinId;
     int _dragOffX, _dragOffY;
     int _origW, _origH;
@@ -845,6 +947,82 @@ static void render_frame(void) {
 
 @implementation ZeroView
 - (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)captureBrowserSnapshot {
+    if (!g_webView || g_webView.isHidden) return;
+    WKSnapshotConfiguration *scfg = [[WKSnapshotConfiguration alloc] init];
+    [g_webView takeSnapshotWithConfiguration:scfg completionHandler:^(NSImage *img, NSError *err) {
+        if (err || !img) return;
+        CGImageRef cgImg = [img CGImageForProposedRect:NULL context:nil hints:nil];
+        if (!cgImg) return;
+        int w = (int)CGImageGetWidth(cgImg);
+        int h = (int)CGImageGetHeight(cgImg);
+        if (w <= 0 || h <= 0) return;
+
+        uint32_t *buf = malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+        if (!buf) return;
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ic = CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+                                                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
+        CGContextDrawImage(ic, CGRectMake(0, 0, w, h), cgImg);
+        CGContextRelease(ic);
+        CGColorSpaceRelease(cs);
+
+        pthread_mutex_lock(&g_lock);
+        free(g_browser_snap);
+        g_browser_snap = buf;
+        g_snap_w = w;
+        g_snap_h = h;
+        pthread_mutex_unlock(&g_lock);
+    }];
+}
+
+- (void)syncWebViewOverlay {
+    if (!g_webView) return;
+    pthread_mutex_lock(&g_lock);
+    SpatialWindow bw = g_wins[WIN_BROWSER];
+    BOOL occluded = is_browser_occluded();
+    BOOL dragging = (_dragMode == 1 || _dragMode == 2);
+    if (g_webView.URL) {
+        const char *cur = [[g_webView.URL absoluteString] UTF8String];
+        if (cur && cur[0]) strncpy(g_browser_url, cur, sizeof(g_browser_url) - 1);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (occluded || dragging) {
+        if (!g_webView.isHidden) {
+            [g_webView setHidden:YES];
+        }
+        return;
+    }
+
+    CGFloat scaleX = self.bounds.size.width / (CGFloat)FB_W;
+    CGFloat scaleY = self.bounds.size.height / (CGFloat)FB_H;
+    CGFloat vx = (bw.x + 4) * scaleX;
+    CGFloat vy = (FB_H - (bw.y + bw.h - 18)) * scaleY;
+    CGFloat vw = MAX(40, (bw.w - 8) * scaleX);
+    CGFloat vh = MAX(40, (bw.h - 74) * scaleY);
+
+    NSRect targetFrame = NSMakeRect(vx, vy, vw, vh);
+    if (!NSEqualRects(g_webView.frame, targetFrame)) {
+        [g_webView setFrame:targetFrame];
+    }
+    if (g_webView.isHidden) {
+        [g_webView setHidden:NO];
+    }
+
+    g_snap_tick++;
+    if (g_snap_tick % 30 == 0) {
+        [self captureBrowserSnapshot];
+    }
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    [self captureBrowserSnapshot];
+    pthread_mutex_lock(&g_lock);
+    snprintf(g_status, sizeof(g_status), "WEB STREAM READY: %s", g_browser_url);
+    pthread_mutex_unlock(&g_lock);
+}
 
 - (NSPoint)fbPointFromEvent:(NSEvent *)event {
     NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
@@ -884,12 +1062,12 @@ static void render_frame(void) {
 
 - (void)updateAiScrollFromY:(CGFloat)fy {
     SpatialWindow *w = &g_wins[WIN_AI_HUD];
-    int by = w->y + 114;
-    int bh = MAX(90, w->h - 128);
-    int vis_rows = MAX(2, (bh - 46) / 16);
+    int by = w->y + 108;
+    int bh = MAX(80, w->h - 124);
+    int vis_rows = MAX(2, (bh - 44) / 16);
     int max_scroll = MAX(0, g_ai_total_lines - vis_rows);
-    int ty = by + 25;
-    int th = MAX(16, bh - 44);
+    int ty = by + 24;
+    int th = MAX(16, bh - 42);
     if (max_scroll > 0) {
         CGFloat ratio = (fy - ty) / (CGFloat)th;
         if (ratio < 0.0) ratio = 0.0;
@@ -913,6 +1091,7 @@ static void render_frame(void) {
 }
 
 - (void)mouseDown:(NSEvent *)event {
+    [self.window makeFirstResponder:self];
     NSPoint fp = [self fbPointFromEvent:event];
     int fx = (int)fp.x, fy = (int)fp.y;
     _dragMode = 0;
@@ -925,7 +1104,6 @@ static void render_frame(void) {
         SpatialWindow *w = &g_wins[wid];
         _dragWinId = wid;
 
-        // Check [COPY] button on terminal windows
         if ((wid == WIN_LINUX || wid == WIN_MACOS) &&
             fx >= w->x + w->w - 66 && fx <= w->x + w->w - 8 &&
             fy >= w->y + 4 && fy <= w->y + 24) {
@@ -934,18 +1112,19 @@ static void render_frame(void) {
             return;
         }
 
-        // Check title bar drag (top 28px)
         if (fy <= w->y + 28) {
+            [self captureBrowserSnapshot];
             _dragMode = 1;
             _dragOffX = fx - w->x;
             _dragOffY = fy - w->y;
             g_ai_input_mode = 0;
+            g_url_input_mode = 0;
             pthread_mutex_unlock(&g_lock);
             return;
         }
 
-        // Check bottom-right resize grip (20x20px corner)
         if (fx >= w->x + w->w - 20 && fy >= w->y + w->h - 20) {
+            [self captureBrowserSnapshot];
             _dragMode = 2;
             _dragOffX = fx;
             _dragOffY = fy;
@@ -955,7 +1134,28 @@ static void render_frame(void) {
             return;
         }
 
-        // Check terminal scrollbar drag
+        if (wid == WIN_BROWSER) {
+            g_ai_input_mode = 0;
+            int bar_y = w->y + 32;
+            if (fy >= bar_y && fy <= bar_y + 22) {
+                if (fx >= w->x + 10 && fx <= w->x + 36) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ [g_webView goBack]; });
+                } else if (fx >= w->x + 40 && fx <= w->x + 66) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ [g_webView reload]; });
+                } else if (fx >= w->x + 72) {
+                    g_url_input_mode = 1;
+                    g_url_input[0] = '\0';
+                    snprintf(g_status, sizeof(g_status), "URL INPUT MODE: PRESS [CMD+V] TO PASTE URL OR TYPE & PRESS [ENTER]");
+                }
+            } else {
+                g_url_input_mode = 0;
+            }
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+
+        g_url_input_mode = 0;
+
         if ((wid == WIN_LINUX || wid == WIN_MACOS) && fx >= w->x + w->w - 20) {
             _dragMode = 4;
             [self updateTermScroll:wid fromY:fy];
@@ -963,9 +1163,8 @@ static void render_frame(void) {
             return;
         }
 
-        // Check AI HUD interactions
         if (wid == WIN_AI_HUD) {
-            int by = w->y + 114;
+            int by = w->y + 108;
             if (fy >= by) {
                 if (fx >= w->x + w->w - 32) {
                     _dragMode = 3;
@@ -978,9 +1177,9 @@ static void render_frame(void) {
             }
         } else {
             g_ai_input_mode = 0;
-            if (wid == WIN_FILES && fy >= w->y + 54) {
-                int clicked = (fy - (w->y + 54)) / 19;
-                int max_vis = MAX(2, (w->h - 66) / 19);
+            if (wid == WIN_FILES && fy >= w->y + 52) {
+                int clicked = (fy - (w->y + 52)) / 19;
+                int max_vis = MAX(2, (w->h - 64) / 19);
                 int start_idx = (g_selected_file >= max_vis) ? (g_selected_file - max_vis + 1) : 0;
                 if (start_idx + clicked < g_file_count) {
                     g_selected_file = start_idx + clicked;
@@ -1015,8 +1214,13 @@ static void render_frame(void) {
 }
 
 - (void)mouseUp:(NSEvent *)event {
+    BOOL wasBrowserResize = (_dragMode == 2 && _dragWinId == WIN_BROWSER);
     _dragMode = 0;
     _dragWinId = -1;
+    if (wasBrowserResize) {
+        [self syncWebViewOverlay];
+        [self captureBrowserSnapshot];
+    }
 }
 
 - (void)scrollWheel:(NSEvent *)event {
@@ -1035,8 +1239,8 @@ static void render_frame(void) {
         else tb->scroll_back = MAX(0, tb->scroll_back - 2);
     } else if (wid == WIN_AI_HUD) {
         SpatialWindow *w = &g_wins[WIN_AI_HUD];
-        int bh = MAX(90, w->h - 128);
-        int vis_rows = MAX(2, (bh - 46) / 16);
+        int bh = MAX(80, w->h - 124);
+        int vis_rows = MAX(2, (bh - 44) / 16);
         int max_scroll = MAX(0, g_ai_total_lines - vis_rows);
         if (dy < 0) g_ai_scroll = MIN(max_scroll, g_ai_scroll + 1);
         else g_ai_scroll = MAX(0, g_ai_scroll - 1);
@@ -1045,6 +1249,7 @@ static void render_frame(void) {
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
+    [self syncWebViewOverlay];
     render_frame();
     CGImageRef img = CGBitmapContextCreateImage(g_ctx);
     if (img) {
@@ -1059,7 +1264,17 @@ static void render_frame(void) {
     if (!clip || clip.length == 0) return;
 
     pthread_mutex_lock(&g_lock);
-    if (g_ai_input_mode) {
+    if (g_url_input_mode) {
+        NSString *flat = [[clip stringByReplacingOccurrencesOfString:@"\r" withString:@""]
+                                stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+        const char *u = [flat UTF8String];
+        if (u) {
+            size_t cur = strlen(g_url_input);
+            size_t rem = sizeof(g_url_input) - 1 - cur;
+            if (rem > 0) strncat(g_url_input, u, rem);
+            snprintf(g_status, sizeof(g_status), "PASTED URL — PRESS [ENTER] TO NAVIGATE");
+        }
+    } else if (g_ai_input_mode) {
         NSString *flat = [[clip stringByReplacingOccurrencesOfString:@"\r" withString:@" "]
                                 stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
         const char *u = [flat UTF8String];
@@ -1129,21 +1344,20 @@ static void render_frame(void) {
         pthread_mutex_lock(&g_lock);
         int back_id = g_z_order[0];
         bring_window_to_front(back_id);
-        g_ai_input_mode = (back_id == WIN_AI_HUD) ? 0 : 0;
+        g_ai_input_mode = 0;
+        g_url_input_mode = 0;
         snprintf(g_status, sizeof(g_status), "ACTIVE WINDOW: %s", g_wins[back_id].title);
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (kc == 120) { // F2 -> Open selected directory
-        if (g_selected_file < g_file_count && g_files[g_selected_file].is_dir) {
-            char next[1024];
-            snprintf(next, sizeof(next), "%s/%s", g_cwd, g_files[g_selected_file].name);
-            char resolved[512];
-            if (realpath(next, resolved)) {
-                scan_directory(resolved);
-                bring_window_to_front(WIN_FILES);
-            }
-        }
+    if (kc == 120 || (kc == 53 && g_url_input_mode)) { // F2 or Esc -> Toggle Browser URL input
+        pthread_mutex_lock(&g_lock);
+        g_url_input_mode = !g_url_input_mode;
+        g_ai_input_mode = 0;
+        g_url_input[0] = '\0';
+        if (g_url_input_mode) bring_window_to_front(WIN_BROWSER);
+        snprintf(g_status, sizeof(g_status), g_url_input_mode ? "URL INPUT MODE: TYPE OR [CMD+V] PASTE URL & PRESS [ENTER]" : "EXITED URL INPUT MODE");
+        pthread_mutex_unlock(&g_lock);
         return;
     }
     if (kc == 99) { // F3 -> Jump to VirtioFS shared directory
@@ -1160,6 +1374,7 @@ static void render_frame(void) {
     if (kc == 98)  { restore_atom_snapshot(); return; }       // F7
     if (kc == 100 || (kc == 53 && g_ai_input_mode)) {         // F8 or Esc
         g_ai_input_mode = !g_ai_input_mode;
+        g_url_input_mode = 0;
         g_ai_prompt[0] = '\0';
         if (g_ai_input_mode) bring_window_to_front(WIN_AI_HUD);
         snprintf(g_status, sizeof(g_status), g_ai_input_mode ? "AI PROMPT MODE: PRESS [CMD+V] TO PASTE OR TYPE & PRESS [ENTER]" : "EXITED AI PROMPT MODE");
@@ -1169,8 +1384,24 @@ static void render_frame(void) {
     if (kc == 109) {                                          // F10 -> Reset spatial layout
         pthread_mutex_lock(&g_lock);
         reset_spatial_layout();
-        snprintf(g_status, sizeof(g_status), "RESET SPATIAL WINDOWS TO DEFAULT MULTI-OS LAYOUT");
+        snprintf(g_status, sizeof(g_status), "RESET 5 SPATIAL WINDOWS TO DEFAULT MULTI-OS LAYOUT");
         pthread_mutex_unlock(&g_lock);
+        return;
+    }
+
+    if (g_url_input_mode) {
+        if (kc == 36) {
+            navigate_browser_to(g_url_input);
+            g_url_input_mode = 0;
+        } else if (kc == 51) {
+            size_t len = strlen(g_url_input);
+            if (len > 0) g_url_input[len - 1] = '\0';
+        } else if (chars.length > 0) {
+            const char *u = [chars UTF8String];
+            if (u && strlen(g_url_input) + strlen(u) < sizeof(g_url_input) - 1) {
+                strcat(g_url_input, u);
+            }
+        }
         return;
     }
 
@@ -1192,8 +1423,16 @@ static void render_frame(void) {
 
     if (kc == 126) { if (g_selected_file > 0) g_selected_file--; return; }
     if (kc == 125) { if (g_selected_file + 1 < g_file_count) g_selected_file++; return; }
+    if (kc == 31 && front_window_id() == WIN_FILES) { // 'o' to open selected dir
+        if (g_selected_file < g_file_count && g_files[g_selected_file].is_dir) {
+            char next[1024];
+            snprintf(next, sizeof(next), "%s/%s", g_cwd, g_files[g_selected_file].name);
+            char resolved[512];
+            if (realpath(next, resolved)) scan_directory(resolved);
+        }
+        return;
+    }
 
-    // Route keyboard input to focused OS window (Linux or macOS)
     if (chars.length > 0) {
         const char *u = [chars UTF8String];
         if (!u) return;
@@ -1245,9 +1484,17 @@ int main(int argc, const char *argv[]) {
                                                     styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
-        [win setTitle:@"ZERO OS v0.4.0 — Spatial Multi-Kernel Compositor (ARM64 Linux + macOS + VirtioFS)"];
+        [win setTitle:@"ZERO OS v0.5.0 — Spatial Multi-Kernel Compositor & Native WebKit Stream"];
         ZeroView *view = [[ZeroView alloc] initWithFrame:NSMakeRect(0, 0, winW, winH)];
         [win setContentView:view];
+
+        // Attach Native WebKit Viewport Subview synchronized to WIN_BROWSER spatial coordinates
+        WKWebViewConfiguration *wcfg = [[WKWebViewConfiguration alloc] init];
+        g_webView = [[WKWebView alloc] initWithFrame:NSMakeRect(600, 380, 650, 320) configuration:wcfg];
+        g_webView.navigationDelegate = view;
+        [view addSubview:g_webView];
+        navigate_browser_to(g_browser_url);
+
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
