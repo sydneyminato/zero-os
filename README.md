@@ -1,54 +1,36 @@
-# ZERO OS (`v0.2.0`) — Universal Native Spatial Compositor & Live PTY Kernel
+# ZERO OS (`v0.3.1`) — Native Hardware Hypervisor, ARM64 Linux Kernel & VirtioFS Bridge
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24355476.svg)]([https://doi.org/10.5281/zenodo.24355476](https://doi.org/10.5281/zenodo.24355476))
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24355476.svg)](https://doi.org/10.5281/zenodo.24355476)
 
-![ZERO OS v0.2.0 Intel x86_64 Native](demo_x86_64.jpg)
+**ZERO OS** is an ultra-lightweight (~100 KB binary), dependency-free native spatial operating environment written in C and Objective-C for macOS. In `v0.3.1`, ZERO OS evolves into a hardware-accelerated Virtual Machine Monitor (VMM) powered by Apple `Virtualization.framework`, booting a real ARM64 Linux kernel alongside a live macOS PTY shell with bidirectional VirtioFS file sharing and native local LLM integration.
 
-A dependency-free, single-file C/Objective-C spatial workspace and lightweight system compositor compiled as a **124 KB Universal Binary (`arm64` + `x86_64`)** for both Apple Silicon and legacy Intel Macs.
+## Core Architecture (`v0.3.1`)
 
----
+* **Hardware Hypervisor & Native Linux Kernel Boot (`Virtualization.framework`)**: Allocates 2 vCPUs and 256 MB RAM directly on Apple Silicon hardware to boot an uncompressed ARM64 Linux kernel (`Image` + `initramfs.img`) in ~0.11 seconds without software emulation.
+* **Bidirectional VirtioFS Direct File Sharing (`VZVirtioFileSystemDeviceConfiguration`)**: Mounts macOS `~/zero_os/shared` directly at `/mnt/macos` inside the guest Linux kernel for zero-latency cross-OS file exchange.
+* **Dual-Kernel Console with Scrollback & Clipboard**: Toggle seamlessly between the Guest Linux Kernel (`aarch64`) and Host macOS Shell (`/bin/zsh`) via `[F1]`, featuring 240-line scrollback history, interactive scrollbars, and clipboard copy/paste (`Cmd+V` / `Shift+Cmd+C`).
+* **Native Local LLM Bridge (`NSURLSession`)**: Connects directly to local inference servers (`127.0.0.1:11434`) with interactive scrollbar navigation and `Cmd+C` / `Cmd+V` clipboard support.
+* **Sub-Millisecond `.atom` State Crystallization**: Serializes active directory state, terminal buffers, decoded pixel memory, and AI responses into a flat binary `.atom` snapshot (`[F6]` Save / `[F7]` Restore).
 
-## Verified Architecture & Real Measurements (No Mockups)
+## Quick Start (macOS Apple Silicon)
 
-Every subsystem in `v0.2.0` executes directly against native OS kernels and system frameworks with **zero external wrapper scripts (no Python, no Electron, no third-party libraries)**:
-
-* **Universal Binary Footprint:** `124,464 bytes` (`Mach-O universal binary` supporting both `arm64` and `x86_64`).
-* **Real Process Memory (Mach Resident RAM):**
-  * **Intel Mac (`x86_64`):** `~30.1 MB`
-  * **Apple Silicon (`arm64`):** `~45.0 – 50.4 MB`
-* **4 Integrated Live Subsystems:**
-  1. **Host Filesystem (`opendir` / `stat`):** Direct POSIX directory traversal and real-time file inspection.
-  2. **Live UNIX Shell (`forkpty`):** Real interactive `/bin/zsh` pseudo-terminal rendered directly into the unified pixel buffer (`uname`, `ls`, `top`, compilers, and network tools execute live).
-  3. **Live Web Stream & `.atom` State Crystallization:** Native `NSURLSession` + `ImageIO` JPEG decoding into unified memory, with sub-millisecond binary snapshot serialization (`state.atom`).
-  4. **Kernel Telemetry & Native Local AI Bridge:** Real-time `task_info` Mach memory reporting, `44.1 kHz` mathematical PCM audio synthesis (`AudioToolbox`), and direct `NSURLSession` HTTP/JSON communication with local LLM endpoints (`127.0.0.1:11434`).
-
----
-
-## Build & Run (Apple Silicon & Intel Mac)
-
-Requires only standard macOS Command Line Tools (`clang`):
+1. Prepare the ARM64 Linux kernel (`~/zero_os/linux/Image` and `initramfs.img`).
+2. Compile with virtualization entitlements (`com.apple.security.virtualization`) and launch:
 
 ```bash
 chmod +x build.sh
 ./build.sh
 ```
 
-To explicitly verify `x86_64` (Intel Mac) execution on Apple Silicon via Rosetta 2:
+## Controls
 
-```bash
-arch -x86_64 ./zero_os
-```
-
----
-
-## Roadmap
-
-* **`v0.1.0` (Archived):** Initial UI concept and defensive prior-art publication (`DOI: 10.5281/zenodo.24355476`).
-* **`v0.2.0` (Current):** Replaced all UI mockups with live POSIX `forkpty()` shell, real filesystem integration, native `NSURLSession` networking/LLM bridge, and Universal `arm64`/`x86_64` binary support (~30 MB RAM on `x86_64`).
-* **`v0.3.0` (Next):** Direct ARM64/x86_64 Linux kernel boot integration via Apple `Virtualization.framework` / `Hypervisor.framework`.
-
----
-
-## License
-
-Apache License 2.0 — Copyright (c) 2026 `sydneyminato` / ZERO OS Project.
+| Key / Action | Function |
+| :--- | :--- |
+| **`[F1]`** or **`[F1: OS]`** | Switch active console between Guest Linux Kernel and Host macOS Shell |
+| **`[F2]`** / **`↑` `↓`** | Navigate and open host POSIX directories |
+| **`[F3]`** | Jump directly to the VirtioFS shared folder (`~/zero_os/shared` <-> `/mnt/macos`) |
+| **`[F4]`** | Boot the ARM64 Linux kernel via `Virtualization.framework` |
+| **`[F5]`** | Fetch and decode a live JPEG stream via `NSURLSession` + `ImageIO` |
+| **`[F6]`** / **`[F7]`** | Crystallize (`state.atom`) or restore spatial workspace state in <1 ms |
+| **`[F8]`** or Click AI Box | Enter local LLM prompt mode (`Cmd+V` to paste, `Enter` to send, `Cmd+C` to copy reply) |
+| **`[F9]`** | Trigger 44.1 kHz direct PCM audio synthesis test |
