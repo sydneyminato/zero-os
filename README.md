@@ -1,3 +1,4 @@
+![ZERO OS v0.3.1 Hardware Hypervisor, ARM64 Linux Kernel & VirtioFS Demo](demo_v031.jpg)
 # ZERO OS (`v0.3.1`) — Native Hardware Hypervisor, ARM64 Linux Kernel & VirtioFS Bridge
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24355476.svg)](https://doi.org/10.5281/zenodo.24355476)
