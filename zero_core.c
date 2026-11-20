@@ -22,7 +22,7 @@
 #define TERM_HIST 240
 #define TERM_MAX_COLS 120
 #define MAX_FILES 64
-#define AI_MAX_LINES 140
+#define AI_MAX_LINES 160
 #define AI_MAX_COLS 120
 
 enum {
@@ -76,7 +76,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static SpatialWindow g_wins[WIN_COUNT];
 static int g_z_order[WIN_COUNT] = { WIN_FILES, WIN_AI_HUD, WIN_MACOS, WIN_LINUX, WIN_BROWSER };
 
-// Native WebKit Spatial Stream state
+// Native WebKit Spatial Stream & Live DOM Perception
 static WKWebView *g_webView = nil;
 static char g_browser_url[512] = "https://github.com/sydneyminato/zero-os";
 static char g_url_input[512] = "";
@@ -84,6 +84,8 @@ static int g_url_input_mode = 0;
 static uint32_t *g_browser_snap = NULL;
 static int g_snap_w = 0, g_snap_h = 0;
 static int g_snap_tick = 0;
+static char g_web_title_cache[256] = "";
+static char g_web_text_cache[1600] = "";
 
 // Host PTY shell state
 static int g_pty_fd = -1;
@@ -107,17 +109,27 @@ static int g_selected_file = 0;
 static uint32_t g_web_img[360 * 240];
 static int g_web_w = 0, g_web_h = 0;
 static int g_web_idx = 0;
-static char g_status[256] = "ZERO OS v0.6.0: AUTONOMOUS AI INTENT ENGINE + MULTI-KERNEL VSS ONLINE";
+static char g_status[256] = "ZERO OS v0.7.0: CLOSED-LOOP AL AGENT + LIVE WEBKIT DOM PERCEPTION";
 
-// Autonomous AI Agent State
+// Closed-Loop AL (Autonomous Layer) Agent State
 static char g_ai_model[64] = "llama3.2";
 static int g_ai_auto_exec = 1;
-static char g_ai_last_action[128] = "READY (VirtioFS + Linux + macOS + WebKit Armed)";
-static char g_ai_reply[4096] = "Click AI box or [F8], paste Japanese/English instruction ([Cmd+V]) & press [Enter].\nExample: Linuxでシステム情報を調べて共有フォルダに保存して、WebでApple Siliconを検索して";
+static int g_al_step = 0;
+static int g_al_max_steps = 3;
+static int g_al_abort = 0;
+static char g_al_goal[1024] = "";
+static char g_ai_last_action[128] = "AL LOOP IDLE (WebKit Reader + Self-Heal Armed)";
+static char g_ai_reply[4096] = "Click AI box or [F8], paste instruction ([Cmd+V]) & [Enter].\nAL Loop reads live WebKit pages, checks exit codes, and self-heals up to 3 steps.\n[F11] Toggle Auto-Exec | [F12] Rollback zero_auto.atom | [Esc] Abort Loop";
 static int g_ai_scroll = 0;
 static int g_ai_total_lines = 1;
 static int g_ai_input_mode = 0;
 static char g_ai_prompt[1024] = "";
+
+// Forward declarations
+static void run_al_step(int step, const char *observation);
+static void capture_web_dom_text(void (^done)(void));
+static void save_atom_snapshot_file(const char *filename, BOOL silent);
+static void restore_atom_snapshot_file(const char *filename);
 
 // --- Spatial Window Layout Initialization ---
 static void reset_spatial_layout(void) {
@@ -153,7 +165,7 @@ static void reset_spatial_layout(void) {
 
     g_wins[WIN_AI_HUD] = (SpatialWindow){
         .id = WIN_AI_HUD,
-        .title = "AUTONOMOUS AI AGENT (127.0.0.1:11434)",
+        .title = "AUTONOMOUS AL AGENT (CLOSED-LOOP PERCEPTION)",
         .x = 20, .y = 400, .w = 424, .h = 360,
         .min_w = 320, .min_h = 210,
         .border_col = 0xFFA855F7,
@@ -233,6 +245,40 @@ static void navigate_browser_to(const char *raw_url) {
             snprintf(g_status, sizeof(g_status), "WEB STREAM: %s", g_browser_url);
         }
     }
+}
+
+// --- Live WebKit DOM Text Perception ---
+static void capture_web_dom_text(void (^done)(void)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_webView) {
+            if (done) done();
+            return;
+        }
+        NSString *js = @"(()=>{let c=document.body?document.body.cloneNode(true):null;if(!c)return JSON.stringify({title:document.title||'',text:''});c.querySelectorAll('nav,header,footer,script,style,noscript').forEach(e=>e.remove());let t=(c.innerText||'').replace(/skip to content/gi,'').replace(/\\s+/g,' ').trim().slice(0,1400);return JSON.stringify({title:document.title||'',text:t});})()";
+        [g_webView evaluateJavaScript:js completionHandler:^(id res, NSError *err) {
+            if (!err && [res isKindOfClass:[NSString class]]) {
+                NSData *d = [(NSString *)res dataUsingEncoding:NSUTF8StringEncoding];
+                if (d) {
+                    NSDictionary *obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                    if ([obj isKindOfClass:[NSDictionary class]]) {
+                        NSString *t = obj[@"title"];
+                        NSString *b = obj[@"text"];
+                        pthread_mutex_lock(&g_lock);
+                        if ([t isKindOfClass:[NSString class]]) {
+                            strncpy(g_web_title_cache, [t UTF8String] ?: "", sizeof(g_web_title_cache) - 1);
+                            g_web_title_cache[sizeof(g_web_title_cache) - 1] = '\0';
+                        }
+                        if ([b isKindOfClass:[NSString class]]) {
+                            strncpy(g_web_text_cache, [b UTF8String] ?: "", sizeof(g_web_text_cache) - 1);
+                            g_web_text_cache[sizeof(g_web_text_cache) - 1] = '\0';
+                        }
+                        pthread_mutex_unlock(&g_lock);
+                    }
+                }
+            }
+            if (done) done();
+        }];
+    });
 }
 
 // --- 44.1 kHz Direct PCM Chime Synthesizer ---
@@ -472,7 +518,7 @@ static void boot_native_linux_kernel(void) {
             snprintf(g_status, sizeof(g_status), "VM START ERROR: %s", [[err localizedDescription] UTF8String]);
         } else {
             g_vm_running = 1;
-            snprintf(g_status, sizeof(g_status), "ZERO OS v0.6.0: AUTONOMOUS AI + LINUX + MACOS + WEBKIT ACTIVE");
+            snprintf(g_status, sizeof(g_status), "ZERO OS v0.7.0: CLOSED-LOOP AL AGENT + LINUX + MACOS + WEBKIT ACTIVE");
             play_pcm_chime();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 const char *welcome = "/bin/busybox --install -s 2>/dev/null; export PATH=/bin:/sbin:/usr/bin:/usr/sbin; mkdir -p /mnt/macos && mount -t virtiofs zero_share /mnt/macos && ls -la /mnt/macos\n";
@@ -521,7 +567,7 @@ static void fetch_live_web_image(void) {
     }] resume];
 }
 
-// --- Autonomous AI Tag Extractor & Cross-OS Execution Bridge ---
+// --- Closed-Loop AL (Autonomous Layer) Perception-Action Engine ---
 static NSString *extract_tag_block(NSString *text, NSString *openTag, NSString *closeTag) {
     NSRange start = [text rangeOfString:openTag options:NSCaseInsensitiveSearch];
     if (start.location == NSNotFound) return nil;
@@ -557,116 +603,219 @@ static void detect_ollama_model(void) {
     }] resume];
 }
 
-static void dispatch_autonomous_intents(NSString *rawResponse) {
-    NSString *linuxCmd = extract_tag_block(rawResponse, @"[LINUX]", @"[/LINUX]");
-    NSString *macosCmd = extract_tag_block(rawResponse, @"[MACOS]", @"[/MACOS]");
+static NSString *harvest_execution_logs(BOOL *outHasError) {
+    NSString *sharedDir = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/shared"];
+    NSString *linLog = [NSString stringWithContentsOfFile:[sharedDir stringByAppendingPathComponent:@"ai_result.txt"] encoding:NSUTF8StringEncoding error:nil];
+    NSString *macLog = [NSString stringWithContentsOfFile:[sharedDir stringByAppendingPathComponent:@"ai_macos_result.txt"] encoding:NSUTF8StringEncoding error:nil];
+
+    NSMutableString *obs = [NSMutableString string];
+    BOOL errFlag = NO;
+
+    if (linLog.length > 0) {
+        NSString *snip = (linLog.length > 600) ? [linLog substringFromIndex:linLog.length - 600] : linLog;
+        [obs appendFormat:@"[LINUX_OUTPUT]\n%@\n", snip];
+        if (([snip rangeOfString:@"LINUX_EXIT:"].location != NSNotFound && [snip rangeOfString:@"LINUX_EXIT:0"].location == NSNotFound) ||
+            [snip rangeOfString:@"can't " options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [snip rangeOfString:@"not found" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [snip rangeOfString:@"No such file" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [snip rangeOfString:@"syntax error" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            errFlag = YES;
+        }
+    }
+    if (macLog.length > 0) {
+        NSString *snip = (macLog.length > 600) ? [macLog substringFromIndex:macLog.length - 600] : macLog;
+        [obs appendFormat:@"[MACOS_OUTPUT]\n%@\n", snip];
+        if (([snip rangeOfString:@"MACOS_EXIT:"].location != NSNotFound && [snip rangeOfString:@"MACOS_EXIT:0"].location == NSNotFound) ||
+            [snip rangeOfString:@"No such file" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [snip rangeOfString:@"command not found" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            errFlag = YES;
+        }
+    }
+    if (outHasError) *outHasError = errFlag;
+    return obs;
+}
+
+static void dispatch_al_step_response(int step, NSString *rawResponse) {
+    NSString *linuxCmd  = extract_tag_block(rawResponse, @"[LINUX]", @"[/LINUX]");
+    NSString *macosCmd  = extract_tag_block(rawResponse, @"[MACOS]", @"[/MACOS]");
     NSString *webTarget = extract_tag_block(rawResponse, @"[WEB]", @"[/WEB]");
+    NSString *spaceWin  = extract_tag_block(rawResponse, @"[SPACE]", @"[/SPACE]");
+    NSString *statusTag = extract_tag_block(rawResponse, @"[STATUS]", @"[/STATUS]");
 
     NSString *sharedDir = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/shared"];
     [[NSFileManager defaultManager] createDirectoryAtPath:sharedDir withIntermediateDirectories:YES attributes:nil error:nil];
 
-    NSMutableArray *actionsDone = [NSMutableArray array];
+    [[NSFileManager defaultManager] removeItemAtPath:[sharedDir stringByAppendingPathComponent:@"ai_result.txt"] error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:[sharedDir stringByAppendingPathComponent:@"ai_macos_result.txt"] error:nil];
 
-    // 1. Autonomous Linux Execution via VirtioFS Bridge
+    NSMutableArray *actionsDone = [NSMutableArray array];
+    BOOL ranLinux = NO, ranMacos = NO, ranWeb = NO;
+
     if (linuxCmd.length > 0 && g_ai_auto_exec) {
         linuxCmd = [linuxCmd stringByReplacingOccurrencesOfString:@"~/zero_os/shared" withString:@"/mnt/macos"];
-        linuxCmd = [linuxCmd stringByReplacingOccurrencesOfString:@"/mnt/macos/shared" withString:@"/mnt/macos"];
         linuxCmd = [linuxCmd stringByReplacingOccurrencesOfString:@"$HOME/zero_os/shared" withString:@"/mnt/macos"];
+        linuxCmd = [linuxCmd stringByReplacingOccurrencesOfString:@"/mnt/macos/shared" withString:@"/mnt/macos"];
+
         NSString *scriptPath = [sharedDir stringByAppendingPathComponent:@"ai_task.sh"];
-        NSString *scriptBody = [NSString stringWithFormat:@"#!/bin/sh\necho '=== [ZERO AI AUTONOMOUS TASK] ==='\n%@\necho '=== [TASK COMPLETE] ==='\n", linuxCmd];
+        NSString *scriptBody = [NSString stringWithFormat:
+            @"#!/bin/sh\necho '=== [AL STEP %d: LINUX] ==='\n%@\nEC=$?\necho \"=== [LINUX_EXIT:$EC] ===\"\n",
+            step, linuxCmd];
         [scriptBody writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod([scriptPath UTF8String], 0755);
 
         if (g_vm_in_fd >= 0 && g_vm_running) {
-            const char *execLine = "sh /mnt/macos/ai_task.sh | tee /mnt/macos/ai_result.txt\n";
+            const char *execLine = "sh /mnt/macos/ai_task.sh > /mnt/macos/ai_result.txt 2>&1; cat /mnt/macos/ai_result.txt\n";
             g_vm_term.scroll_back = 0;
             write(g_vm_in_fd, execLine, strlen(execLine));
             bring_window_to_front(WIN_LINUX);
-            [actionsDone addObject:@"Linux(VirtioFS)"];
-        } else {
-            [actionsDone addObject:@"Saved ai_task.sh"];
+            [actionsDone addObject:@"Linux"];
+            ranLinux = YES;
         }
     }
 
-    // 2. Autonomous macOS Host Shell Execution
     if (macosCmd.length > 0 && g_ai_auto_exec) {
         NSString *macScript = [sharedDir stringByAppendingPathComponent:@"ai_macos.sh"];
-        NSString *macBody = [NSString stringWithFormat:@"#!/bin/zsh\n%@\n", macosCmd];
+        NSString *macBody = [NSString stringWithFormat:
+            @"#!/bin/zsh\necho '=== [AL STEP %d: MACOS] ==='\n%@\nEC=$?\necho \"=== [MACOS_EXIT:$EC] ===\"\n",
+            step, macosCmd];
         [macBody writeToFile:macScript atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod([macScript UTF8String], 0755);
 
         if (g_pty_fd >= 0) {
-            const char *execMac = "zsh ~/zero_os/shared/ai_macos.sh\n";
+            const char *execMac = "zsh ~/zero_os/shared/ai_macos.sh > ~/zero_os/shared/ai_macos_result.txt 2>&1; cat ~/zero_os/shared/ai_macos_result.txt\n";
             g_host_term.scroll_back = 0;
             write(g_pty_fd, execMac, strlen(execMac));
-            if (!linuxCmd.length) bring_window_to_front(WIN_MACOS);
-            [actionsDone addObject:@"macOS(PTY)"];
+            if (!ranLinux) bring_window_to_front(WIN_MACOS);
+            [actionsDone addObject:@"macOS"];
+            ranMacos = YES;
         }
     }
 
-    // 3. Autonomous Spatial Web Browser Navigation / Search
     if (webTarget.length > 0 && g_ai_auto_exec) {
         navigate_browser_to([webTarget UTF8String]);
-        if (!linuxCmd.length && !macosCmd.length) {
-            bring_window_to_front(WIN_BROWSER);
-        }
+        if (!ranLinux && !ranMacos) bring_window_to_front(WIN_BROWSER);
         [actionsDone addObject:@"WebKit"];
+        ranWeb = YES;
     }
 
-    if (actionsDone.count > 0) {
-        scan_directory([sharedDir UTF8String]);
-        NSString *summary = [actionsDone componentsJoinedByString:@" + "];
-        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "EXECUTED: %s", [summary UTF8String]);
-        snprintf(g_status, sizeof(g_status), "AI AUTONOMOUS EXECUTION -> %s", [summary UTF8String]);
-        play_pcm_chime();
-    } else if (!g_ai_auto_exec && (linuxCmd.length > 0 || macosCmd.length > 0 || webTarget.length > 0)) {
-        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "PLAN READY (Press [F11] for Auto-Exec)");
-    } else {
-        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "RESPONSE READY (Chat Mode)");
+    if (spaceWin.length > 0 && g_ai_auto_exec) {
+        NSString *u = [spaceWin uppercaseString];
+        if ([u containsString:@"LINUX"]) bring_window_to_front(WIN_LINUX);
+        else if ([u containsString:@"MACOS"]) bring_window_to_front(WIN_MACOS);
+        else if ([u containsString:@"WEB"]) bring_window_to_front(WIN_BROWSER);
+        else if ([u containsString:@"FILE"]) bring_window_to_front(WIN_FILES);
     }
+
+    BOOL wantContinue = (statusTag && [[statusTag uppercaseString] containsString:@"CONTINUE"]);
+    BOOL anyAction = (ranLinux || ranMacos || ranWeb);
+
+    if (anyAction) {
+        scan_directory([sharedDir UTF8String]);
+        NSString *summary = [actionsDone componentsJoinedByString:@"+"];
+        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "STEP %d/%d EXEC: %s", step, g_al_max_steps, [summary UTF8String]);
+        snprintf(g_status, sizeof(g_status), "AL STEP %d/%d -> EXECUTING %s & OBSERVING RESULTS...", step, g_al_max_steps, [summary UTF8String]);
+    } else {
+        g_al_step = 0;
+        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "AL COMPLETE (Step %d/%d)", step, g_al_max_steps);
+        snprintf(g_status, sizeof(g_status), "AL LOOP COMPLETE (STEP %d/%d)", step, g_al_max_steps);
+        play_pcm_chime();
+        return;
+    }
+
+    double delaySec = ranWeb ? 3.2 : 2.2;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        capture_web_dom_text(^{
+            pthread_mutex_lock(&g_lock);
+            scan_directory([sharedDir UTF8String]);
+            if (g_al_abort || !g_ai_auto_exec) {
+                g_al_step = 0;
+                snprintf(g_ai_last_action, sizeof(g_ai_last_action), "AL LOOP STOPPED");
+                pthread_mutex_unlock(&g_lock);
+                return;
+            }
+
+            BOOL hasError = NO;
+            NSString *obs = harvest_execution_logs(&hasError);
+            if ((hasError || wantContinue) && step < g_al_max_steps) {
+                int nextStep = step + 1;
+                g_al_step = nextStep;
+                const char *reason = hasError ? "SELF-HEALING ERROR..." : "READING WEB/OUTPUT FOR NEXT STEP...";
+                snprintf(g_ai_last_action, sizeof(g_ai_last_action), "STEP %d/%d: %s", nextStep, g_al_max_steps, reason);
+                snprintf(g_status, sizeof(g_status), "AL LOOP STEP %d/%d -> %s", nextStep, g_al_max_steps, reason);
+                NSString *obsCopy = obs.length > 0 ? obs : @"Web navigation completed; see Live WebKit Viewport text above.";
+                pthread_mutex_unlock(&g_lock);
+                run_al_step(nextStep, [obsCopy UTF8String]);
+            } else {
+                g_al_step = 0;
+                snprintf(g_ai_last_action, sizeof(g_ai_last_action), hasError ? "AL FINISHED WITH WARNING (Step %d)" : "AL COMPLETE & VERIFIED (Step %d/%d)", step, g_al_max_steps);
+                snprintf(g_status, sizeof(g_status), "AL CLOSED-LOOP VERIFIED (STEP %d/%d)", step, g_al_max_steps);
+                play_pcm_chime();
+                pthread_mutex_unlock(&g_lock);
+            }
+        });
+    });
 }
 
-static void query_local_ai_native(const char *prompt) {
-    if (!prompt || !prompt[0]) return;
+static void run_al_step(int step, const char *observation) {
+    pthread_mutex_lock(&g_lock);
+    NSString *goalStr   = [NSString stringWithUTF8String:g_al_goal] ?: @"";
+    NSString *obsStr    = [NSString stringWithUTF8String:observation ?: ""] ?: @"";
+    NSString *webUrl    = [NSString stringWithUTF8String:g_browser_url] ?: @"";
+    NSString *webTitle  = [NSString stringWithUTF8String:g_web_title_cache] ?: @"";
+    NSString *webText   = [NSString stringWithUTF8String:g_web_text_cache] ?: @"";
+    NSString *modelName = [NSString stringWithUTF8String:g_ai_model] ?: @"llama3.2";
+    pthread_mutex_unlock(&g_lock);
+
     NSURL *url = [NSURL URLWithString:@"http://127.0.0.1:11434/api/generate"];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     req.timeoutInterval = 45.0;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
-    NSString *uStr = [NSString stringWithUTF8String:prompt];
-    if (!uStr) return;
-
     NSString *sysPrompt =
-        @"You are the Autonomous Kernel & Spatial Agent inside ZERO OS (macOS host + ARM64 Alpine Linux guest sharing /mnt/macos <-> ~/zero_os/shared + native WebKit browser). "
-        @"Respond concisely in the user's language (Japanese if prompted in Japanese). "
-        @"Whenever the user asks to inspect, create files, run commands, or search/open the web, append executable action blocks using these exact tags:\n"
-        @"[LINUX]\n<POSIX /bin/sh commands for Alpine Linux; shared folder is /mnt/macos>\n[/LINUX]\n"
-        @"[MACOS]\n<zsh commands for macOS host; shared folder is ~/zero_os/shared>\n[/MACOS]\n"
-        @"[WEB]\n<plain search keywords like Apple Silicon, or an exact known https:// URL>\n[/WEB]\n"
-        @"Rules: (1) In [LINUX], use POSIX /bin/sh only (use seq 1 9, NEVER {0..9} bash braces) and write files directly to /mnt/macos/ (NEVER /mnt/macos/shared/). "
-        @"(2) In [MACOS], NEVER access /mnt/macos; read ~/zero_os/shared/ directly. "
-        @"(3) In [WEB], for searches output ONLY plain search keywords (e.g. Apple Silicon) and NEVER invent or guess URLs like https://apple.com/... "
-        @"(4) Example format:\n[LINUX]\necho \"$(date) $(uname -a)\" > /mnt/macos/info.txt\n[/LINUX]\n[MACOS]\ncat ~/zero_os/shared/info.txt\n[/MACOS]\n[WEB]\nApple Silicon\n[/WEB]\n"
-        @"Only include tags relevant to the request. Keep scripts clean, safe, and non-interactive.";
+        @"You are the Closed-Loop AL (Autonomous Layer) Agent inside ZERO OS (macOS host + ARM64 Alpine Linux guest sharing /mnt/macos <-> ~/zero_os/shared + live WebKit browser).\n"
+        @"You operate in a multi-step perception-action loop (max 3 steps). You can see the LIVE WebKit browser text and previous command outputs/exit codes.\n"
+        @"Respond concisely in the user's language, and output executable action blocks using these exact tags:\n"
+        @"[LINUX]\n<POSIX /bin/sh commands for Alpine Linux; shared dir is /mnt/macos>\n[/LINUX]\n"
+        @"[MACOS]\n<zsh commands for macOS host; shared dir is ~/zero_os/shared>\n[/MACOS]\n"
+        @"[WEB]\n<plain search keywords like Apple Silicon, or exact https:// URL>\n[/WEB]\n"
+        @"[SPACE]\n<LINUX or MACOS or WEB or FILES>\n[/SPACE]\n"
+        @"[STATUS]\n<CONTINUE if you need to read the result of this step's [WEB] or [LINUX] in the next step, otherwise DONE>\n[/STATUS]\n"
+        @"Critical Rules:\n"
+        @"1. In [LINUX], use POSIX /bin/sh only (use seq 1 9, NEVER {0..9} braces) and write files to /mnt/macos/ (NEVER /mnt/macos/shared/).\n"
+        @"2. In [MACOS], NEVER access /mnt/macos; read ~/zero_os/shared/ directly.\n"
+        @"3. In [WEB], for searches output ONLY plain search keywords (e.g. Apple Silicon) and NEVER guess/invent URLs.\n"
+        @"4. If the user asks to read/summarize the currently open Web page, use the Live WebKit Content provided below immediately without re-navigating.\n"
+        @"5. If the user asks to search the Web first and then save/process what you find, output [WEB]keywords[/WEB] and [STATUS]CONTINUE[/STATUS] on Step 1, then on Step 2 read the updated WebKit Content and write the file.\n"
+        @"6. If Previous Execution Observation shows a non-zero EXIT code or error, fix the command and re-run it.";
 
-    NSString *fullPrompt = [NSString stringWithFormat:@"%@\n\nUser Instruction: %@", sysPrompt, uStr];
-    NSString *modelName = [NSString stringWithUTF8String:g_ai_model];
+    NSString *fullPrompt = [NSString stringWithFormat:
+        @"%@\n\n=== CURRENT PERCEPTION (STEP %d / %d) ===\n"
+        @"User Goal: %@\n"
+        @"Live WebKit Browser URL: %@\n"
+        @"Live WebKit Page Title: %@\n"
+        @"Live WebKit Page Text: %@\n"
+        @"Previous Execution Observation:\n%@\n",
+        sysPrompt, step, g_al_max_steps, goalStr, webUrl, webTitle,
+        webText.length > 0 ? webText : @"(empty)", obsStr];
 
     NSDictionary *body = @{
-        @"model": modelName ?: @"llama3.2",
+        @"model": modelName,
         @"prompt": fullPrompt,
         @"stream": @NO,
         @"keep_alive": @"30m"
     };
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    snprintf(g_ai_reply, sizeof(g_ai_reply), "Thinking & planning spatial actions via %s...", g_ai_model);
-    snprintf(g_ai_last_action, sizeof(g_ai_last_action), "PLANNING INTENT...");
-    g_ai_scroll = 0;
 
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         pthread_mutex_lock(&g_lock);
+        if (g_al_abort) {
+            g_al_step = 0;
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
         if (err || !data) {
+            g_al_step = 0;
             snprintf(g_ai_reply, sizeof(g_ai_reply), "Ollama waking up -> auto-launching Ollama.app...");
             snprintf(g_ai_last_action, sizeof(g_ai_last_action), "WAKING OLLAMA...");
             system("open -a Ollama >/dev/null 2>&1 &");
@@ -675,8 +824,10 @@ static void query_local_ai_native(const char *prompt) {
             NSString *res = json[@"response"];
             if (res) {
                 NSString *clean = [res stringByReplacingOccurrencesOfString:@"\r" withString:@""];
-                snprintf(g_ai_reply, sizeof(g_ai_reply), "%s", [clean UTF8String]);
-                dispatch_autonomous_intents(clean);
+                snprintf(g_ai_reply, sizeof(g_ai_reply), "[AL STEP %d/%d]\n%s", step, g_al_max_steps, [clean UTF8String]);
+                dispatch_al_step_response(step, clean);
+            } else {
+                g_al_step = 0;
             }
         }
         g_ai_scroll = 0;
@@ -684,10 +835,28 @@ static void query_local_ai_native(const char *prompt) {
     }] resume];
 }
 
+static void start_autonomous_loop(const char *prompt) {
+    if (!prompt || !prompt[0]) return;
+    pthread_mutex_lock(&g_lock);
+    strncpy(g_al_goal, prompt, sizeof(g_al_goal) - 1);
+    g_al_goal[sizeof(g_al_goal) - 1] = '\0';
+    g_al_abort = 0;
+    g_al_step = 1;
+    snprintf(g_ai_reply, sizeof(g_ai_reply), "[AL STEP 1/%d] Perceiving WebKit DOM & spatial state...", g_al_max_steps);
+    snprintf(g_ai_last_action, sizeof(g_ai_last_action), "AL STEP 1/%d: PERCEIVING...", g_al_max_steps);
+    g_ai_scroll = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    save_atom_snapshot_file("zero_auto.atom", YES);
+    capture_web_dom_text(^{
+        run_al_step(1, "Initial step: no commands executed yet.");
+    });
+}
+
 // --- .atom Binary State Crystallization ---
-static void save_atom_snapshot(void) {
+static void save_atom_snapshot_file(const char *filename, BOOL silent) {
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    snap->magic = 0x5A455243;
+    snap->magic = 0x5A455244;
     memcpy(snap->wins, g_wins, sizeof(g_wins));
     memcpy(snap->z_order, g_z_order, sizeof(g_z_order));
     strncpy(snap->cwd, g_cwd, sizeof(snap->cwd) - 1);
@@ -698,26 +867,32 @@ static void save_atom_snapshot(void) {
     snap->img_h = g_web_h;
     memcpy(snap->img_buf, g_web_img, sizeof(g_web_img));
 
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/state.atom"];
+    NSString *rel = [NSString stringWithFormat:@"zero_os/%s", filename];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:rel];
     FILE *f = fopen([path UTF8String], "wb");
     if (f) {
         fwrite(snap, sizeof(ZeroAtomSnapshot), 1, f);
         fclose(f);
-        snprintf(g_status, sizeof(g_status), "CRYSTALLIZED 5-WINDOW AUTONOMOUS STATE -> state.atom (%lu KB)", sizeof(ZeroAtomSnapshot) / 1024);
-        play_pcm_chime();
+        if (!silent) {
+            snprintf(g_status, sizeof(g_status), "CRYSTALLIZED 5-WINDOW STATE -> %s (%lu KB)", filename, sizeof(ZeroAtomSnapshot) / 1024);
+            play_pcm_chime();
+        }
     }
     free(snap);
 }
 
-static void restore_atom_snapshot(void) {
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/state.atom"];
+static void restore_atom_snapshot_file(const char *filename) {
+    NSString *rel = [NSString stringWithFormat:@"zero_os/%s", filename];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:rel];
     FILE *f = fopen([path UTF8String], "rb");
     if (!f) {
-        snprintf(g_status, sizeof(g_status), "NO .ATOM SNAPSHOT FOUND (PRESS [F6] FIRST)");
+        snprintf(g_status, sizeof(g_status), "NO %s FOUND (PRESS [F6] FIRST)", filename);
         return;
     }
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455243) {
+    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455244) {
+        g_al_abort = 1;
+        g_al_step = 0;
         memcpy(g_wins, snap->wins, sizeof(g_wins));
         memcpy(g_z_order, snap->z_order, sizeof(g_z_order));
         scan_directory(snap->cwd);
@@ -727,10 +902,10 @@ static void restore_atom_snapshot(void) {
         g_web_w = snap->img_w;
         g_web_h = snap->img_h;
         memcpy(g_web_img, snap->img_buf, sizeof(g_web_img));
-        snprintf(g_status, sizeof(g_status), "INSTANTLY RESTORED 5-WINDOW SPATIAL STATE IN <1 MS");
+        snprintf(g_status, sizeof(g_status), "RESTORED SPATIAL CHECKPOINT (%s) IN <1 MS", filename);
         play_pcm_chime();
     } else {
-        snprintf(g_status, sizeof(g_status), "PREVIOUS .ATOM FORMAT — PRESS [F6] TO SAVE v0.6.0 STATE");
+        snprintf(g_status, sizeof(g_status), "PREVIOUS .ATOM FORMAT — PRESS [F6] TO SAVE v0.7.0 STATE");
     }
     fclose(f);
     free(snap);
@@ -879,11 +1054,11 @@ static void render_files_window(SpatialWindow *w, NSColor *cCyan, NSColor *cAmbe
 
 static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGreen, NSColor *cAmber, NSColor *cWhite, NSColor *cDim) {
     char info1[110], info2[110];
-    snprintf(info1, sizeof(info1), "RAM: %.1fMB | MODEL: %s | AUTO: %s",
-             get_mach_ram_mb(), g_ai_model, g_ai_auto_exec ? "ON [F11]" : "OFF [F11]");
+    snprintf(info1, sizeof(info1), "RAM: %.1fMB | %s | AUTO:%s",
+             get_mach_ram_mb(), g_ai_model, g_ai_auto_exec ? "ON" : "OFF");
     snprintf(info2, sizeof(info2), "%s", g_ai_last_action);
     draw_text(w->x + 12, w->y + 34, info1, 10.5, cGreen, YES);
-    draw_text(w->x + 12, w->y + 52, info2, 10.5, cAmber, YES);
+    draw_text(w->x + 12, w->y + 52, info2, 10.5, g_al_step > 0 ? cCyan : cAmber, YES);
 
     if (g_web_w > 0 && g_web_h > 0 && w->w >= 400) {
         int tw = 84, th = 56;
@@ -907,17 +1082,17 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
     int bw = MAX(180, w->w - 24);
     int bh = MAX(80, w->h - 114);
     fill_rect(bx, by, bw, bh, 0xFF080A10);
-    draw_border(bx, by, bw, bh, g_ai_input_mode ? 0xFFF59E0B : 0xFF3B4254, 1);
-    draw_text(bx + 8, by + 6, "INTENT AGENT — [F8] Instruct | [Cmd+V] Paste", 10.5, cCyan, YES);
+    draw_border(bx, by, bw, bh, g_ai_input_mode ? 0xFFF59E0B : (g_al_step > 0 ? 0xFF38BDF8 : 0xFF3B4254), 1);
+    draw_text(bx + 8, by + 6, "AL LOOP — [F8] Goal | [F12] Rollback | [Esc] Stop", 10.5, cCyan, YES);
 
     if (g_ai_input_mode) {
         NSString *pNs = [NSString stringWithUTF8String:g_ai_prompt];
         NSString *disp = pNs ?: @"";
         if (disp.length > 36) disp = [disp substringFromIndex:disp.length - 36];
         char pbuf[256];
-        snprintf(pbuf, sizeof(pbuf), "CMD> %s_", [disp UTF8String]);
+        snprintf(pbuf, sizeof(pbuf), "GOAL> %s_", [disp UTF8String]);
         draw_text(bx + 8, by + 30, pbuf, 11, cAmber, YES);
-        draw_text(bx + 8, by + bh - 20, "[Cmd+V] Paste JP/EN | [Enter] Execute | [Esc] Cancel", 10, cDim, NO);
+        draw_text(bx + 8, by + bh - 20, "[Cmd+V] Paste JP/EN | [Enter] Start AL | [Esc] Cancel", 10, cDim, NO);
     } else {
         int cols = MAX(16, (bw - 30) / 7);
         int vis_rows = MAX(2, (bh - 44) / 16);
@@ -1003,7 +1178,7 @@ static void render_browser_window(SpatialWindow *w, BOOL is_front, NSColor *cPin
         draw_text(vx + 16, vy + 20, "Loading Native WebKit Viewport...", 12, cDim, NO);
     }
 
-    draw_text(w->x + 12, w->y + w->h - 16, "[F2] Edit URL | [Cmd+V] Paste URL | AI Can Navigate Autonomously", 10, cDim, NO);
+    draw_text(w->x + 12, w->y + w->h - 16, "[F2] URL | Live DOM Text Streamed Directly to AL Perception", 10, cDim, NO);
 }
 
 static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
@@ -1071,7 +1246,7 @@ static void render_frame(void) {
     fill_rect(0, FB_H - 24, FB_W, 24, 0xFF0F172A);
     fill_rect(0, FB_H - 24, FB_W, 1, 0xFF1E293B);
     draw_text(14, FB_H - 20, g_status, 11, cGreen, YES);
-    draw_text(720, FB_H - 20, "[F1] Win | [F2] URL | [F3] Shared | [F8] AI | [F10] Reset | [F11] Auto", 10.5, cCyan, NO);
+    draw_text(700, FB_H - 20, "[F1] Win | [F3] Shared | [F8] AL Goal | [F11] Auto | [F12] Rollback", 10.5, cCyan, NO);
 
     [NSGraphicsContext setCurrentContext:prevCtx];
     pthread_mutex_unlock(&g_lock);
@@ -1155,8 +1330,11 @@ static void render_frame(void) {
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     [self captureBrowserSnapshot];
+    capture_web_dom_text(nil);
     pthread_mutex_lock(&g_lock);
-    snprintf(g_status, sizeof(g_status), "WEB STREAM READY: %s", g_browser_url);
+    if (g_al_step == 0) {
+        snprintf(g_status, sizeof(g_status), "WEB STREAM & DOM PERCEPTION READY: %s", g_browser_url);
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1308,7 +1486,7 @@ static void render_frame(void) {
                 } else {
                     g_ai_input_mode = 1;
                     g_ai_prompt[0] = '\0';
-                    snprintf(g_status, sizeof(g_status), "AUTONOMOUS INTENT MODE: [CMD+V] PASTE JP/EN INSTRUCTION & PRESS [ENTER]");
+                    snprintf(g_status, sizeof(g_status), "AL GOAL MODE: [CMD+V] PASTE JP/EN GOAL & PRESS [ENTER]");
                 }
             }
         } else {
@@ -1417,7 +1595,7 @@ static void render_frame(void) {
             size_t cur = strlen(g_ai_prompt);
             size_t rem = sizeof(g_ai_prompt) - 1 - cur;
             if (rem > 0) strncat(g_ai_prompt, u, rem);
-            snprintf(g_status, sizeof(g_status), "PASTED INTENT (%lu BYTES) — PRESS [ENTER] TO EXECUTE", strlen(g_ai_prompt));
+            snprintf(g_status, sizeof(g_status), "PASTED AL GOAL (%lu BYTES) — PRESS [ENTER] TO LAUNCH", strlen(g_ai_prompt));
         }
     } else {
         const char *u = [clip UTF8String];
@@ -1445,7 +1623,7 @@ static void render_frame(void) {
         NSPasteboard *pb = [NSPasteboard generalPasteboard];
         [pb clearContents];
         [pb setString:text forType:NSPasteboardTypeString];
-        snprintf(g_status, sizeof(g_status), "COPIED AI PLAN/REPLY TO CLIPBOARD (%lu CHARS)", (unsigned long)text.length);
+        snprintf(g_status, sizeof(g_status), "COPIED AL LOG TO CLIPBOARD (%lu CHARS)", (unsigned long)text.length);
     }
     pthread_mutex_unlock(&g_lock);
 }
@@ -1475,7 +1653,17 @@ static void render_frame(void) {
         }
     }
 
-    if (kc == 122) { // F1 -> Cycle frontmost spatial window
+    if (kc == 53 && g_al_step > 0) {
+        pthread_mutex_lock(&g_lock);
+        g_al_abort = 1;
+        g_al_step = 0;
+        snprintf(g_ai_last_action, sizeof(g_ai_last_action), "AL LOOP ABORTED BY USER");
+        snprintf(g_status, sizeof(g_status), "ABORTED CLOSED-LOOP AL EXECUTION");
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+
+    if (kc == 122) { // F1
         pthread_mutex_lock(&g_lock);
         int back_id = g_z_order[0];
         bring_window_to_front(back_id);
@@ -1495,7 +1683,7 @@ static void render_frame(void) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (kc == 99) { // F3 -> Jump to VirtioFS shared directory
+    if (kc == 99) { // F3
         char shared[512];
         snprintf(shared, sizeof(shared), "%s/zero_os/shared", getenv("HOME"));
         scan_directory(shared);
@@ -1503,30 +1691,36 @@ static void render_frame(void) {
         snprintf(g_status, sizeof(g_status), "VIRTIOFS SHARED DIR: ~/zero_os/shared <-> /mnt/macos");
         return;
     }
-    if (kc == 118) { boot_native_linux_kernel(); return; }    // F4
-    if (kc == 96)  { fetch_live_web_image(); return; }        // F5
-    if (kc == 97)  { save_atom_snapshot(); return; }          // F6
-    if (kc == 98)  { restore_atom_snapshot(); return; }       // F7
-    if (kc == 100 || (kc == 53 && g_ai_input_mode)) {         // F8 or Esc
+    if (kc == 118) { boot_native_linux_kernel(); return; }                  // F4
+    if (kc == 96)  { fetch_live_web_image(); return; }                      // F5
+    if (kc == 97)  { save_atom_snapshot_file("state.atom", NO); return; }   // F6
+    if (kc == 98)  { restore_atom_snapshot_file("state.atom"); return; }    // F7
+    if (kc == 100 || (kc == 53 && g_ai_input_mode)) {                       // F8 or Esc
         g_ai_input_mode = !g_ai_input_mode;
         g_url_input_mode = 0;
         g_ai_prompt[0] = '\0';
         if (g_ai_input_mode) bring_window_to_front(WIN_AI_HUD);
-        snprintf(g_status, sizeof(g_status), g_ai_input_mode ? "AUTONOMOUS INTENT MODE: [CMD+V] PASTE JP/EN INSTRUCTION & PRESS [ENTER]" : "EXITED INTENT MODE");
+        snprintf(g_status, sizeof(g_status), g_ai_input_mode ? "AL GOAL MODE: [CMD+V] PASTE JP/EN GOAL & PRESS [ENTER]" : "EXITED AL GOAL MODE");
         return;
     }
-    if (kc == 101) { play_pcm_chime(); return; }              // F9
-    if (kc == 109) {                                          // F10 -> Reset layout
+    if (kc == 101) { play_pcm_chime(); return; }                            // F9
+    if (kc == 109) {                                                        // F10
         pthread_mutex_lock(&g_lock);
         reset_spatial_layout();
         snprintf(g_status, sizeof(g_status), "RESET 5 SPATIAL WINDOWS TO DEFAULT MULTI-OS LAYOUT");
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (kc == 103) {                                          // F11 -> Toggle Autonomous Execution
+    if (kc == 103) {                                                        // F11
         pthread_mutex_lock(&g_lock);
         g_ai_auto_exec = !g_ai_auto_exec;
-        snprintf(g_status, sizeof(g_status), "AI AUTONOMOUS EXECUTION: %s", g_ai_auto_exec ? "ENABLED (DIRECT CROSS-OS CONTROL)" : "DISABLED (PLAN ONLY)");
+        snprintf(g_status, sizeof(g_status), "AL AUTO-EXECUTION: %s", g_ai_auto_exec ? "ENABLED (CLOSED-LOOP)" : "DISABLED (PLAN ONLY)");
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    if (kc == 111) {                                                        // F12
+        pthread_mutex_lock(&g_lock);
+        restore_atom_snapshot_file("zero_auto.atom");
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -1549,7 +1743,7 @@ static void render_frame(void) {
 
     if (g_ai_input_mode) {
         if (kc == 36) {
-            query_local_ai_native(g_ai_prompt);
+            start_autonomous_loop(g_ai_prompt);
             g_ai_input_mode = 0;
         } else if (kc == 51) {
             size_t len = strlen(g_ai_prompt);
@@ -1627,7 +1821,7 @@ int main(int argc, const char *argv[]) {
                                                     styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
-        [win setTitle:@"ZERO OS v0.6.0 — Autonomous AI Intent Engine & Multi-Kernel Spatial Compositor"];
+        [win setTitle:@"ZERO OS v0.7.0 — Closed-Loop AL Agent & WebKit DOM Perception"];
         ZeroView *view = [[ZeroView alloc] initWithFrame:NSMakeRect(0, 0, winW, winH)];
         [win setContentView:view];
 

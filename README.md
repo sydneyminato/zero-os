@@ -1,30 +1,27 @@
-# ZERO OS (`v0.6.0`) — Autonomous AI Intent Engine & Multi-Kernel Spatial Compositor
+# ZERO OS (`v0.7.0`) — Closed-Loop AL (Autonomous Layer) & Multi-Kernel Spatial Compositor
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24355476.svg)](https://doi.org/10.5281/zenodo.24355476)
 
-![ZERO OS v0.6.0 Autonomous AI Intent Engine Demo](demo_v060.jpg)
+![ZERO OS v0.7.0 Closed-Loop AL Agent Demo](demo_v070.jpg)
 
-**ZERO OS** unifies an ARM64 Linux kernel (`Virtualization.framework`), a live host macOS PTY shell, bidirectional VirtioFS storage, an Apple Silicon-native `WebKit` browser stream, and an **Autonomous Local AI Intent Engine (`127.0.0.1:11434`)** inside a single pointer-driven **Virtual Streaming System (VSS)**—running within an ~187 KB binary and **~80 MB total host Mach memory footprint**.
+**ZERO OS** unifies an ARM64 Linux kernel (`Virtualization.framework`), a live host macOS PTY shell, bidirectional VirtioFS storage, an Apple Silicon-native `WebKit` browser stream, and a **Closed-Loop AL (Autonomous Layer) Agent (`127.0.0.1:11434`)** inside a single pointer-driven **Virtual Streaming System (VSS)**—running within an ~190 KB binary and **~40–80 MB total host Mach memory footprint**.
 
-## What is New in `v0.6.0`
+## What is New in `v0.7.0` (Closed-Loop AL Architecture)
 
-* **Autonomous Cross-OS AI Execution (`[LINUX]` / `[MACOS]` / `[WEB]`)**: Translates natural-language instructions (Japanese/English) into executable scripts dispatched automatically across the guest Linux kernel via VirtioFS (`/mnt/macos/ai_task.sh`), the host macOS shell (`~/zero_os/shared/ai_macos.sh`), and the live spatial `WebKit` browser.
-* **Automatic Cross-OS Path Normalization**: Rewrites host/guest path mismatches (`~/zero_os/shared` <-> `/mnt/macos`) in real time inside the C bridge so compact local LLMs execute cross-kernel pipelines reliably.
-* **AppKit-Synchronized Overlay Pipeline**: Decouples subview frame synchronization from `drawRect:` rendering for rock-solid 30 fps spatial window compositing alongside hardware-accelerated web media.
-
-## Core Architecture
-
-* **Spatial Multi-Kernel Window Compositor**: Five independent, overlapping windows with dynamic Z-order focus, title-bar dragging, bottom-right corner resizing (`◢`), and per-window clipping directly over a unified `uint32_t` framebuffer.
-* **Zero-Bloat Spatial Web Browser (`WebKit` VSS Viewport)**: Hardware-accelerated `WKWebView` synchronized to `WIN_BROWSER` with automatic Z-order occlusion snapshots.
-* **Hardware Hypervisor & VirtioFS (`Virtualization.framework`)**: Boots an uncompressed ARM64 Linux kernel (`Image` + `initramfs.img`, 2 vCPUs, 256 MB RAM) in ~0.15 seconds with zero-latency file coexistence (`~/zero_os/shared` <-> `/mnt/macos`).
-* **Pointer-Driven `.atom` Spatial Crystallization (`[F6]` / `[F7]`)**: Serializes the entire 5-window spatial state—including window coordinates, Z-order stack, active browser URL, directory path, pixel buffers, and AI state—into a flat binary `.atom` snapshot in <1 ms.
+* **Closed-Loop Perception-Action-Verification (`Observe -> Reason -> Act -> Verify`)**: Evolves from one-shot command dispatch (`v0.6.0`) to a multi-step autonomous loop (up to 3 steps) that reads live execution results and adapts its next action automatically.
+* **Live WebKit DOM Perception**: Extracts real-time page titles and cleaned body text directly from the spatial `WKWebView` viewport into the AL agent perception buffer, enabling direct web reading, summarization, and cross-OS file generation.
+* **Exit-Code Telemetry & Self-Healing (`LINUX_EXIT` / `MACOS_EXIT`)**: Captures exit codes and stdout/stderr across both guest Linux (`/mnt/macos/ai_result.txt`) and host macOS (`~/zero_os/shared/ai_macos_result.txt`) to verify completion or self-heal command errors.
+* **Autonomous `.atom` Checkpoint & Rollback (`zero_auto.atom` / `[F12]`)**: Automatically crystallizes the full 5-window spatial state in <1 ms prior to autonomous execution, allowing instant rollback via `[F12]` or immediate loop abort via `[Esc]`.
+* **Autonomous Spatial Focus (`[SPACE]`)**: Allows the AL agent to dynamically bring `LINUX`, `MACOS`, `WEB`, or `FILES` windows to the front based on the active task phase.
 
 ## Controls
 
 | Key / Action | Function |
 | :--- | :--- |
-| **`[F8]`** or Click AI Box | Enter Autonomous AI Intent mode (`Cmd+V` paste instruction, `Enter` execute) |
-| **`[F11]`** | Toggle AI Autonomous Execution (`AUTO: ON` / `Plan Only`) |
+| **`[F8]`** or Click AI Box | Enter Closed-Loop AL Goal mode (`Cmd+V` paste goal, `Enter` start loop) |
+| **`[F11]`** | Toggle AL Auto-Execution (`AUTO: ON` / `Plan Only`) |
+| **`[F12]`** | Rollback immediately to pre-execution `zero_auto.atom` checkpoint (<1 ms) |
+| **`[Esc]`** | Abort active multi-step AL loop or exit input mode |
 | **Drag Title Bar / Corner `◢`** | Move spatial windows freely or resize dynamically with live reflow |
 | **Click Window / `[F1]`** | Bring window to front (Z-order) and route input focus |
 | **`[F2]`** or Click URL Bar | Edit Spatial Browser URL (`Cmd+V` to paste URL, `Enter` to navigate) |
