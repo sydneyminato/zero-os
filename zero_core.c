@@ -18,7 +18,7 @@
 
 #define FB_W 1280
 #define FB_H 800
-#define WIN_COUNT 5
+#define WIN_COUNT 6
 #define TERM_HIST 240
 #define TERM_MAX_COLS 120
 #define MAX_FILES 64
@@ -30,7 +30,8 @@ enum {
     WIN_MACOS = 1,
     WIN_FILES = 2,
     WIN_AI_HUD = 3,
-    WIN_BROWSER = 4
+    WIN_BROWSER = 4,
+    WIN_UBUNTU = 5
 };
 
 typedef struct {
@@ -74,7 +75,7 @@ static CGContextRef g_ctx = NULL;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static SpatialWindow g_wins[WIN_COUNT];
-static int g_z_order[WIN_COUNT] = { WIN_FILES, WIN_AI_HUD, WIN_MACOS, WIN_LINUX, WIN_BROWSER };
+static int g_z_order[WIN_COUNT] = { WIN_FILES, WIN_AI_HUD, WIN_MACOS, WIN_LINUX, WIN_BROWSER, WIN_UBUNTU };
 
 // Native WebKit Spatial Stream & Live DOM Perception
 static WKWebView *g_webView = nil;
@@ -92,14 +93,26 @@ static int g_pty_fd = -1;
 static pid_t g_pty_pid = -1;
 static TermBuffer g_host_term = { .total_lines = 1 };
 
-// Guest Linux Kernel VM state
+// Guest Alpine Linux Kernel VM state
 static int g_vm_in_fd = -1;
 static int g_vm_out_fd = -1;
 static TermBuffer g_vm_term = { .total_lines = 1 };
 static int g_vm_running = 0;
+
+// Guest Ubuntu Desktop GUI VM state
 #if defined(__arm64__)
 static VZVirtualMachine *g_vz_vm = nil;
+static VZVirtualMachine *g_ubuntu_vm = nil;
+static VZVirtualMachineView *g_ubuntuView = nil;
 #endif
+static int g_ubuntu_running = 0;
+static char g_ubuntu_state_msg[256] = "Checking ~/zero_os/ubuntu/disk.img ...";
+#if defined(__arm64__)
+static NSWindow *g_ubuntuPopoutWin = nil;
+#endif
+static int g_ubuntu_popout = 0;
+static char g_ubuntu_fr_name[64] = "-";
+static int g_last_kc = -1;
 
 static char g_cwd[512];
 static FileEntry g_files[MAX_FILES];
@@ -109,7 +122,7 @@ static int g_selected_file = 0;
 static uint32_t g_web_img[360 * 240];
 static int g_web_w = 0, g_web_h = 0;
 static int g_web_idx = 0;
-static char g_status[256] = "ZERO OS v0.7.0: CLOSED-LOOP AL AGENT + LIVE WEBKIT DOM PERCEPTION";
+static char g_status[256] = "ZERO OS v0.8.0-dev: 6-WINDOW SPATIAL COMPOSITOR + UBUNTU VIRTIO-GPU";
 
 // Closed-Loop AL (Autonomous Layer) Agent State
 static char g_ai_model[64] = "llama3.2";
@@ -119,35 +132,64 @@ static int g_al_max_steps = 3;
 static int g_al_abort = 0;
 static char g_al_goal[1024] = "";
 static char g_ai_last_action[128] = "AL LOOP IDLE (WebKit Reader + Self-Heal Armed)";
-static char g_ai_reply[4096] = "Click AI box or [F8], paste instruction ([Cmd+V]) & [Enter].\nAL Loop reads live WebKit pages, checks exit codes, and self-heals up to 3 steps.\n[F11] Toggle Auto-Exec | [F12] Rollback zero_auto.atom | [Esc] Abort Loop";
+static char g_ai_reply[4096] = "Click AI box or [F8], paste instruction ([Cmd+V]) & [Enter].\nAL Loop reads live WebKit pages, checks exit codes, and self-heals up to 3 steps.\n[F5] Boot Ubuntu GUI | [F11] Auto-Exec | [F12] Rollback";
 static int g_ai_scroll = 0;
 static int g_ai_total_lines = 1;
 static int g_ai_input_mode = 0;
 static char g_ai_prompt[1024] = "";
 
-// Forward declarations
 static void run_al_step(int step, const char *observation);
 static void capture_web_dom_text(void (^done)(void));
 static void save_atom_snapshot_file(const char *filename, BOOL silent);
 static void restore_atom_snapshot_file(const char *filename);
+static void boot_ubuntu_desktop_gui(void);
 
-// --- Spatial Window Layout Initialization ---
 static void reset_spatial_layout(void) {
     g_wins[WIN_LINUX] = (SpatialWindow){
         .id = WIN_LINUX,
-        .title = "GUEST LINUX KERNEL (ARM64 HYPERVISOR | /mnt/macos)",
-        .x = 20, .y = 20, .w = 560, .h = 360,
-        .min_w = 340, .min_h = 190,
+        .title = "ALPINE LINUX KERNEL (ARM64 | /mnt/macos)",
+        .x = 16, .y = 16, .w = 404, .h = 350,
+        .min_w = 300, .min_h = 180,
         .border_col = 0xFF38BDF8,
         .title_bg   = 0xFF102A43,
         .body_bg    = 0xFF0B111A
     };
 
+    g_wins[WIN_UBUNTU] = (SpatialWindow){
+        .id = WIN_UBUNTU,
+        .title = "UBUNTU DESKTOP GUI (ARM64 VIRTIO-GPU STREAM)",
+        .x = 430, .y = 16, .w = 440, .h = 370,
+        .min_w = 340, .min_h = 240,
+        .border_col = 0xFFF97316,
+        .title_bg   = 0xFF431407,
+        .body_bg    = 0xFF140C08
+    };
+
+    g_wins[WIN_BROWSER] = (SpatialWindow){
+        .id = WIN_BROWSER,
+        .title = "SPATIAL WEB BROWSER (WEBKIT STREAM)",
+        .x = 880, .y = 16, .w = 384, .h = 370,
+        .min_w = 320, .min_h = 220,
+        .border_col = 0xFFEC4899,
+        .title_bg   = 0xFF3B1228,
+        .body_bg    = 0xFF0F131D
+    };
+
+    g_wins[WIN_AI_HUD] = (SpatialWindow){
+        .id = WIN_AI_HUD,
+        .title = "AUTONOMOUS AL AGENT (CLOSED-LOOP)",
+        .x = 16, .y = 376, .w = 404, .h = 388,
+        .min_w = 300, .min_h = 200,
+        .border_col = 0xFFA855F7,
+        .title_bg   = 0xFF28153E,
+        .body_bg    = 0xFF11131F
+    };
+
     g_wins[WIN_MACOS] = (SpatialWindow){
         .id = WIN_MACOS,
         .title = "HOST MACOS SHELL (POSIX /bin/zsh)",
-        .x = 460, .y = 420, .w = 500, .h = 340,
-        .min_w = 320, .min_h = 180,
+        .x = 430, .y = 396, .w = 500, .h = 368,
+        .min_w = 300, .min_h = 180,
         .border_col = 0xFF30F28C,
         .title_bg   = 0xFF123524,
         .body_bg    = 0xFF0C1410
@@ -156,31 +198,11 @@ static void reset_spatial_layout(void) {
     g_wins[WIN_FILES] = (SpatialWindow){
         .id = WIN_FILES,
         .title = "VIRTIOFS FILES ([O] Open | [F3] Shared)",
-        .x = 976, .y = 440, .w = 284, .h = 320,
-        .min_w = 250, .min_h = 180,
+        .x = 940, .y = 396, .w = 324, .h = 368,
+        .min_w = 240, .min_h = 180,
         .border_col = 0xFFF59E0B,
         .title_bg   = 0xFF33220A,
         .body_bg    = 0xFF12151E
-    };
-
-    g_wins[WIN_AI_HUD] = (SpatialWindow){
-        .id = WIN_AI_HUD,
-        .title = "AUTONOMOUS AL AGENT (CLOSED-LOOP PERCEPTION)",
-        .x = 20, .y = 400, .w = 424, .h = 360,
-        .min_w = 320, .min_h = 210,
-        .border_col = 0xFFA855F7,
-        .title_bg   = 0xFF28153E,
-        .body_bg    = 0xFF11131F
-    };
-
-    g_wins[WIN_BROWSER] = (SpatialWindow){
-        .id = WIN_BROWSER,
-        .title = "SPATIAL WEB BROWSER (NATIVE WEBKIT STREAM)",
-        .x = 600, .y = 20, .w = 660, .h = 400,
-        .min_w = 360, .min_h = 240,
-        .border_col = 0xFFEC4899,
-        .title_bg   = 0xFF3B1228,
-        .body_bg    = 0xFF0F131D
     };
 
     g_z_order[0] = WIN_FILES;
@@ -188,6 +210,7 @@ static void reset_spatial_layout(void) {
     g_z_order[2] = WIN_MACOS;
     g_z_order[3] = WIN_LINUX;
     g_z_order[4] = WIN_BROWSER;
+    g_z_order[5] = WIN_UBUNTU;
 }
 
 static int front_window_id(void) {
@@ -206,16 +229,17 @@ static void bring_window_to_front(int win_id) {
     g_z_order[WIN_COUNT - 1] = win_id;
 }
 
-static BOOL is_browser_occluded(void) {
-    int bpos = -1;
+static BOOL is_window_occluded(int target_wid) {
+    int tpos = -1;
     for (int i = 0; i < WIN_COUNT; i++) {
-        if (g_z_order[i] == WIN_BROWSER) { bpos = i; break; }
+        if (g_z_order[i] == target_wid) { tpos = i; break; }
     }
-    SpatialWindow *bw = &g_wins[WIN_BROWSER];
-    for (int i = bpos + 1; i < WIN_COUNT; i++) {
+    if (tpos < 0) return YES;
+    SpatialWindow *tw = &g_wins[target_wid];
+    for (int i = tpos + 1; i < WIN_COUNT; i++) {
         SpatialWindow *ow = &g_wins[g_z_order[i]];
-        BOOL overlapX = (bw->x < ow->x + ow->w) && (bw->x + bw->w > ow->x);
-        BOOL overlapY = (bw->y < ow->y + ow->h) && (bw->y + bw->h > ow->y);
+        BOOL overlapX = (tw->x < ow->x + ow->w) && (tw->x + tw->w > ow->x);
+        BOOL overlapY = (tw->y < ow->y + ow->h) && (tw->y + tw->h > ow->y);
         if (overlapX && overlapY) return YES;
     }
     return NO;
@@ -247,7 +271,6 @@ static void navigate_browser_to(const char *raw_url) {
     }
 }
 
-// --- Live WebKit DOM Text Perception ---
 static void capture_web_dom_text(void (^done)(void)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!g_webView) {
@@ -281,7 +304,6 @@ static void capture_web_dom_text(void (^done)(void)) {
     });
 }
 
-// --- 44.1 kHz Direct PCM Chime Synthesizer ---
 typedef struct {
     double phase;
     int samples_left;
@@ -334,7 +356,6 @@ static void play_pcm_chime(void) {
     }
 }
 
-// --- Real Host Filesystem Scanner ---
 static void scan_directory(const char *path) {
     DIR *d = opendir(path);
     if (!d) return;
@@ -364,7 +385,6 @@ static void scan_directory(const char *path) {
     closedir(d);
 }
 
-// --- Scrollback Terminal Buffer Helpers ---
 static void term_newline(TermBuffer *tb) {
     if (tb->total_lines < TERM_HIST) {
         tb->total_lines++;
@@ -448,11 +468,10 @@ static void init_live_pty(void) {
     write(g_pty_fd, init_cmd, strlen(init_cmd));
 }
 
-// --- Apple Virtualization.framework Native Linux Kernel + VirtioFS Boot ---
 static void boot_native_linux_kernel(void) {
 #if defined(__arm64__)
     if (g_vm_running) {
-        snprintf(g_status, sizeof(g_status), "LINUX KERNEL ALREADY RUNNING ON HARDWARE HYPERVISOR");
+        snprintf(g_status, sizeof(g_status), "ALPINE LINUX KERNEL ALREADY RUNNING");
         return;
     }
     NSString *base = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/linux"];
@@ -509,7 +528,6 @@ static void boot_native_linux_kernel(void) {
     }
 
     g_vz_vm = [[VZVirtualMachine alloc] initWithConfiguration:cfg];
-    snprintf(g_status, sizeof(g_status), "BOOTING ARM64 LINUX KERNEL + VIRTIOFS IN SPATIAL WINDOW...");
 
     [g_vz_vm startWithCompletionHandler:^(NSError *err) {
         pthread_mutex_lock(&g_lock);
@@ -518,7 +536,7 @@ static void boot_native_linux_kernel(void) {
             snprintf(g_status, sizeof(g_status), "VM START ERROR: %s", [[err localizedDescription] UTF8String]);
         } else {
             g_vm_running = 1;
-            snprintf(g_status, sizeof(g_status), "ZERO OS v0.7.0: CLOSED-LOOP AL AGENT + LINUX + MACOS + WEBKIT ACTIVE");
+            snprintf(g_status, sizeof(g_status), "ZERO OS v0.8.0-dev: ALPINE + UBUNTU GUI + MACOS + WEBKIT + AL");
             play_pcm_chime();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 const char *welcome = "/bin/busybox --install -s 2>/dev/null; export PATH=/bin:/sbin:/usr/bin:/usr/sbin; mkdir -p /mnt/macos && mount -t virtiofs zero_share /mnt/macos && ls -la /mnt/macos\n";
@@ -527,12 +545,139 @@ static void boot_native_linux_kernel(void) {
         }
         pthread_mutex_unlock(&g_lock);
     }];
-#else
-    snprintf(g_status, sizeof(g_status), "x86_64 MODE: RUNNING HOST SHELL (ARM64 VZ KERNEL DISABLED)");
 #endif
 }
 
-// --- Native NSURLSession Web Image Fetcher ---
+static void boot_ubuntu_desktop_gui(void) {
+#if defined(__arm64__)
+    if (g_ubuntu_running) {
+        snprintf(g_status, sizeof(g_status), "UBUNTU DESKTOP GUI ALREADY RUNNING ON VIRTIO-GPU");
+        return;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *ubuntuDir = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/ubuntu"];
+    NSString *sharedDir = [NSHomeDirectory() stringByAppendingPathComponent:@"zero_os/shared"];
+    [fm createDirectoryAtPath:ubuntuDir withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:sharedDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *diskPath = [ubuntuDir stringByAppendingPathComponent:@"disk.img"];
+    NSString *isoPath  = [ubuntuDir stringByAppendingPathComponent:@"ubuntu.iso"];
+    NSString *efiPath  = [ubuntuDir stringByAppendingPathComponent:@"efi_vars.bin"];
+
+    BOOL hasDisk = [fm fileExistsAtPath:diskPath];
+    BOOL hasIso  = [fm fileExistsAtPath:isoPath];
+
+    if (!hasDisk && !hasIso) {
+        snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg),
+                 "Awaiting ARM64 Ubuntu image at ~/zero_os/ubuntu/ubuntu.iso or disk.img (Press [F5] after placing)");
+        return;
+    }
+
+    if (!hasDisk && hasIso) {
+        int fd = open([diskPath UTF8String], O_CREAT | O_RDWR, 0644);
+        if (fd >= 0) {
+            ftruncate(fd, 20ULL * 1024ULL * 1024ULL * 1024ULL);
+            close(fd);
+            hasDisk = YES;
+        }
+    }
+
+    NSError *err = nil;
+    VZEFIVariableStore *efiStore = nil;
+    if ([fm fileExistsAtPath:efiPath]) {
+        efiStore = [[VZEFIVariableStore alloc] initWithURL:[NSURL fileURLWithPath:efiPath]];
+    } else {
+        efiStore = [[VZEFIVariableStore alloc] initCreatingVariableStoreAtURL:[NSURL fileURLWithPath:efiPath] options:0 error:&err];
+    }
+    if (!efiStore) {
+        snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg), "EFI STORE ERROR: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+
+    VZEFIBootLoader *boot = [[VZEFIBootLoader alloc] init];
+    boot.variableStore = efiStore;
+
+    VZVirtualMachineConfiguration *cfg = [[VZVirtualMachineConfiguration alloc] init];
+    cfg.CPUCount = 2;
+    cfg.memorySize = 2048ULL * 1024ULL * 1024ULL;
+    cfg.bootLoader = boot;
+    cfg.platform = [[VZGenericPlatformConfiguration alloc] init];
+
+    VZVirtioGraphicsDeviceConfiguration *gfx = [[VZVirtioGraphicsDeviceConfiguration alloc] init];
+    gfx.scanouts = @[[[VZVirtioGraphicsScanoutConfiguration alloc] initWithWidthInPixels:1024 heightInPixels:768]];
+    cfg.graphicsDevices = @[gfx];
+    VZVirtioSoundDeviceConfiguration *soundDev = [[VZVirtioSoundDeviceConfiguration alloc] init];
+    VZVirtioSoundDeviceOutputStreamConfiguration *outStream = [[VZVirtioSoundDeviceOutputStreamConfiguration alloc] init];
+    outStream.sink = [[VZHostAudioOutputStreamSink alloc] init];
+    soundDev.streams = @[outStream];
+    cfg.audioDevices = @[soundDev];
+
+    cfg.pointingDevices = @[[[VZUSBScreenCoordinatePointingDeviceConfiguration alloc] init]];
+    cfg.keyboards = @[[[VZUSBKeyboardConfiguration alloc] init]];
+
+    VZVirtioNetworkDeviceConfiguration *net = [[VZVirtioNetworkDeviceConfiguration alloc] init];
+    net.attachment = [[VZNATNetworkDeviceAttachment alloc] init];
+    VZMACAddress *uMac = [[VZMACAddress alloc] initWithString:@"c6:90:47:d1:f2:dc"]; if (uMac) net.MACAddress = uMac;
+    cfg.networkDevices = @[net];
+    VZVirtioConsoleDeviceConfiguration *spiceConsole = [[VZVirtioConsoleDeviceConfiguration alloc] init];
+    VZVirtioConsolePortConfiguration *spicePort = [[VZVirtioConsolePortConfiguration alloc] init];
+    spicePort.name = VZSpiceAgentPortAttachment.spiceAgentPortName;
+    VZSpiceAgentPortAttachment *spiceAtt = [[VZSpiceAgentPortAttachment alloc] init];
+    spiceAtt.sharesClipboard = YES;
+    spicePort.attachment = spiceAtt;
+    spiceConsole.ports[0] = spicePort;
+    cfg.consoleDevices = @[spiceConsole];
+    cfg.entropyDevices = @[[[VZVirtioEntropyDeviceConfiguration alloc] init]];
+
+    NSMutableArray *storage = [NSMutableArray array];
+    if (hasDisk) {
+        VZDiskImageStorageDeviceAttachment *diskAtt = [[VZDiskImageStorageDeviceAttachment alloc] initWithURL:[NSURL fileURLWithPath:diskPath] readOnly:NO cachingMode:VZDiskImageCachingModeCached synchronizationMode:VZDiskImageSynchronizationModeFull error:&err];
+        if (diskAtt) [storage addObject:[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:diskAtt]];
+    }
+    if (hasIso) {
+        VZDiskImageStorageDeviceAttachment *isoAtt = [[VZDiskImageStorageDeviceAttachment alloc] initWithURL:[NSURL fileURLWithPath:isoPath] readOnly:YES error:&err];
+        if (isoAtt) [storage addObject:[[VZVirtioBlockDeviceConfiguration alloc] initWithAttachment:isoAtt]];
+    }
+    cfg.storageDevices = storage;
+
+    VZSharedDirectory *vzDir = [[VZSharedDirectory alloc] initWithURL:[NSURL fileURLWithPath:sharedDir] readOnly:NO];
+    VZSingleDirectoryShare *share = [[VZSingleDirectoryShare alloc] initWithDirectory:vzDir];
+    VZVirtioFileSystemDeviceConfiguration *fsDev = [[VZVirtioFileSystemDeviceConfiguration alloc] initWithTag:@"zero_share"];
+    fsDev.share = share;
+    cfg.directorySharingDevices = @[fsDev];
+
+    if (![cfg validateWithError:&err]) {
+        snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg), "UBUNTU VZ CONFIG ERROR: %s", [[err localizedDescription] UTF8String]);
+        return;
+    }
+
+    g_ubuntu_vm = [[VZVirtualMachine alloc] initWithConfiguration:cfg];
+    snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg), "BOOTING UBUNTU ARM64 GUI VIA VIRTIO-GPU...");
+
+    if ([NSThread isMainThread]) {
+        if (g_ubuntuView) g_ubuntuView.virtualMachine = g_ubuntu_vm;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            if (g_ubuntuView) g_ubuntuView.virtualMachine = g_ubuntu_vm;
+        });
+    }
+
+    [g_ubuntu_vm startWithCompletionHandler:^(NSError *startErr) {
+        pthread_mutex_lock(&g_lock);
+        if (startErr) {
+            g_ubuntu_running = 0;
+            snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg), "UBUNTU START ERROR: %s", [[startErr localizedDescription] UTF8String]);
+        } else {
+            g_ubuntu_running = 1;
+            snprintf(g_ubuntu_state_msg, sizeof(g_ubuntu_state_msg), "UBUNTU DESKTOP GUI LIVE (1024x768 VIRTIO-GPU)");
+            snprintf(g_status, sizeof(g_status), "UBUNTU DESKTOP GUI LIVE IN SPATIAL WINDOW + VIRTIOFS!");
+            play_pcm_chime();
+        }
+        pthread_mutex_unlock(&g_lock);
+    }];
+#endif
+}
+
 static void fetch_live_web_image(void) {
     const char *urls[] = {
         "https://picsum.photos/id/1015/360/240.jpg",
@@ -567,7 +712,6 @@ static void fetch_live_web_image(void) {
     }] resume];
 }
 
-// --- Closed-Loop AL (Autonomous Layer) Perception-Action Engine ---
 static NSString *extract_tag_block(NSString *text, NSString *openTag, NSString *closeTag) {
     NSRange start = [text rangeOfString:openTag options:NSCaseInsensitiveSearch];
     if (start.location == NSNotFound) return nil;
@@ -700,7 +844,8 @@ static void dispatch_al_step_response(int step, NSString *rawResponse) {
 
     if (spaceWin.length > 0 && g_ai_auto_exec) {
         NSString *u = [spaceWin uppercaseString];
-        if ([u containsString:@"LINUX"]) bring_window_to_front(WIN_LINUX);
+        if ([u containsString:@"UBUNTU"]) bring_window_to_front(WIN_UBUNTU);
+        else if ([u containsString:@"LINUX"]) bring_window_to_front(WIN_LINUX);
         else if ([u containsString:@"MACOS"]) bring_window_to_front(WIN_MACOS);
         else if ([u containsString:@"WEB"]) bring_window_to_front(WIN_BROWSER);
         else if ([u containsString:@"FILE"]) bring_window_to_front(WIN_FILES);
@@ -773,13 +918,13 @@ static void run_al_step(int step, const char *observation) {
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
     NSString *sysPrompt =
-        @"You are the Closed-Loop AL (Autonomous Layer) Agent inside ZERO OS (macOS host + ARM64 Alpine Linux guest sharing /mnt/macos <-> ~/zero_os/shared + live WebKit browser).\n"
+        @"You are the Closed-Loop AL (Autonomous Layer) Agent inside ZERO OS (macOS host + ARM64 Alpine Linux + Ubuntu Desktop GUI sharing /mnt/macos <-> ~/zero_os/shared + live WebKit browser).\n"
         @"You operate in a multi-step perception-action loop (max 3 steps). You can see the LIVE WebKit browser text and previous command outputs/exit codes.\n"
         @"Respond concisely in the user's language, and output executable action blocks using these exact tags:\n"
         @"[LINUX]\n<POSIX /bin/sh commands for Alpine Linux; shared dir is /mnt/macos>\n[/LINUX]\n"
         @"[MACOS]\n<zsh commands for macOS host; shared dir is ~/zero_os/shared>\n[/MACOS]\n"
         @"[WEB]\n<plain search keywords like Apple Silicon, or exact https:// URL>\n[/WEB]\n"
-        @"[SPACE]\n<LINUX or MACOS or WEB or FILES>\n[/SPACE]\n"
+        @"[SPACE]\n<UBUNTU or LINUX or MACOS or WEB or FILES>\n[/SPACE]\n"
         @"[STATUS]\n<CONTINUE if you need to read the result of this step's [WEB] or [LINUX] in the next step, otherwise DONE>\n[/STATUS]\n"
         @"Critical Rules:\n"
         @"1. In [LINUX], use POSIX /bin/sh only (use seq 1 9, NEVER {0..9} braces) and write files to /mnt/macos/ (NEVER /mnt/macos/shared/).\n"
@@ -853,10 +998,9 @@ static void start_autonomous_loop(const char *prompt) {
     });
 }
 
-// --- .atom Binary State Crystallization ---
 static void save_atom_snapshot_file(const char *filename, BOOL silent) {
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    snap->magic = 0x5A455244;
+    snap->magic = 0x5A455245;
     memcpy(snap->wins, g_wins, sizeof(g_wins));
     memcpy(snap->z_order, g_z_order, sizeof(g_z_order));
     strncpy(snap->cwd, g_cwd, sizeof(snap->cwd) - 1);
@@ -874,7 +1018,7 @@ static void save_atom_snapshot_file(const char *filename, BOOL silent) {
         fwrite(snap, sizeof(ZeroAtomSnapshot), 1, f);
         fclose(f);
         if (!silent) {
-            snprintf(g_status, sizeof(g_status), "CRYSTALLIZED 5-WINDOW STATE -> %s (%lu KB)", filename, sizeof(ZeroAtomSnapshot) / 1024);
+            snprintf(g_status, sizeof(g_status), "CRYSTALLIZED 6-WINDOW STATE -> %s (%lu KB)", filename, sizeof(ZeroAtomSnapshot) / 1024);
             play_pcm_chime();
         }
     }
@@ -890,7 +1034,7 @@ static void restore_atom_snapshot_file(const char *filename) {
         return;
     }
     ZeroAtomSnapshot *snap = calloc(1, sizeof(ZeroAtomSnapshot));
-    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455244) {
+    if (fread(snap, sizeof(ZeroAtomSnapshot), 1, f) == 1 && snap->magic == 0x5A455245) {
         g_al_abort = 1;
         g_al_step = 0;
         memcpy(g_wins, snap->wins, sizeof(g_wins));
@@ -902,16 +1046,15 @@ static void restore_atom_snapshot_file(const char *filename) {
         g_web_w = snap->img_w;
         g_web_h = snap->img_h;
         memcpy(g_web_img, snap->img_buf, sizeof(g_web_img));
-        snprintf(g_status, sizeof(g_status), "RESTORED SPATIAL CHECKPOINT (%s) IN <1 MS", filename);
+        snprintf(g_status, sizeof(g_status), "RESTORED 6-WINDOW CHECKPOINT (%s) IN <1 MS", filename);
         play_pcm_chime();
     } else {
-        snprintf(g_status, sizeof(g_status), "PREVIOUS .ATOM FORMAT — PRESS [F6] TO SAVE v0.7.0 STATE");
+        snprintf(g_status, sizeof(g_status), "PREVIOUS .ATOM FORMAT — PRESS [F6] TO SAVE 6-WINDOW STATE");
     }
     fclose(f);
     free(snap);
 }
 
-// --- Direct Framebuffer Drawing Helpers ---
 static void fill_rect(int x, int y, int w, int h, uint32_t col) {
     int x0 = MAX(0, x), y0 = MAX(0, y);
     int x1 = MIN(FB_W, x + w), y1 = MIN(FB_H, y + h);
@@ -933,8 +1076,12 @@ static void draw_text(int x, int y, const char *str, CGFloat size, NSColor *colo
     if (!str || !str[0]) return;
     NSString *ns = [NSString stringWithUTF8String:str];
     if (!ns) return;
+    if (size <= 0) size = 12.0;
     NSFont *font = bold ? [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightBold]
                         : [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+    if (!font) font = [NSFont systemFontOfSize:size];
+    if (!color) color = [NSColor whiteColor];
+    if (!font || !color) return;
     NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: color};
     [ns drawAtPoint:NSMakePoint(x, y) withAttributes:attrs];
 }
@@ -1060,8 +1207,8 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
     draw_text(w->x + 12, w->y + 34, info1, 10.5, cGreen, YES);
     draw_text(w->x + 12, w->y + 52, info2, 10.5, g_al_step > 0 ? cCyan : cAmber, YES);
 
-    if (g_web_w > 0 && g_web_h > 0 && w->w >= 400) {
-        int tw = 84, th = 56;
+    if (g_web_w > 0 && g_web_h > 0 && w->w >= 390) {
+        int tw = 78, th = 52;
         int tx = w->x + w->w - tw - 12;
         int ty = w->y + 34;
         for (int j = 0; j < th; j++) {
@@ -1078,9 +1225,9 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
     }
 
     int bx = w->x + 12;
-    int by = w->y + 98;
+    int by = w->y + 94;
     int bw = MAX(180, w->w - 24);
-    int bh = MAX(80, w->h - 114);
+    int bh = MAX(80, w->h - 110);
     fill_rect(bx, by, bw, bh, 0xFF080A10);
     draw_border(bx, by, bw, bh, g_ai_input_mode ? 0xFFF59E0B : (g_al_step > 0 ? 0xFF38BDF8 : 0xFF3B4254), 1);
     draw_text(bx + 8, by + 6, "AL LOOP — [F8] Goal | [F12] Rollback | [Esc] Stop", 10.5, cCyan, YES);
@@ -1088,7 +1235,7 @@ static void render_ai_hud_window(SpatialWindow *w, NSColor *cCyan, NSColor *cGre
     if (g_ai_input_mode) {
         NSString *pNs = [NSString stringWithUTF8String:g_ai_prompt];
         NSString *disp = pNs ?: @"";
-        if (disp.length > 36) disp = [disp substringFromIndex:disp.length - 36];
+        if (disp.length > 34) disp = [disp substringFromIndex:disp.length - 34];
         char pbuf[256];
         snprintf(pbuf, sizeof(pbuf), "GOAL> %s_", [disp UTF8String]);
         draw_text(bx + 8, by + 30, pbuf, 11, cAmber, YES);
@@ -1178,16 +1325,45 @@ static void render_browser_window(SpatialWindow *w, BOOL is_front, NSColor *cPin
         draw_text(vx + 16, vy + 20, "Loading Native WebKit Viewport...", 12, cDim, NO);
     }
 
-    draw_text(w->x + 12, w->y + w->h - 16, "[F2] URL | Live DOM Text Streamed Directly to AL Perception", 10, cDim, NO);
+    draw_text(w->x + 12, w->y + w->h - 16, "[F2] URL | Live DOM Text -> AL Perception", 10, cDim, NO);
+}
+
+static void render_ubuntu_window(SpatialWindow *w, NSColor *cOrange, NSColor *cAmber, NSColor *cWhite, NSColor *cDim) {
+    int vx = w->x + 4;
+    int vy = w->y + 32;
+    int vw = w->w - 8;
+    int vh = w->h - 52;
+
+    int pbx = w->x + w->w - 78;
+    int pby = w->y + 5;
+    fill_rect(pbx, pby, 68, 18, 0xFF0F172A);
+    draw_border(pbx, pby, 68, 18, w->border_col, 1);
+    draw_text(pbx + 6, pby + 2, g_ubuntu_popout ? "[DOCK]" : "[POPOUT]", 10.0, cOrange, YES);
+
+    fill_rect(vx, vy, vw, vh, 0xFF1A0F0A);
+    if (g_ubuntu_popout) {
+        draw_text(vx + 14, vy + 24, "UBUNTU ACTIVE IN DIRECT INPUT WINDOW", 11.5, cOrange, YES);
+        draw_text(vx + 14, vy + 48, "Operate Ubuntu in the separate window.", 10.5, cWhite, NO);
+        draw_text(vx + 14, vy + 68, "Click [DOCK] or close it to return here.", 10.5, cDim, NO);
+    } else {
+        draw_text(vx + 14, vy + 18, "UBUNTU ARM64 DESKTOP (VIRTIO-GPU 1024x768)", 11.5, cOrange, YES);
+        draw_text(vx + 14, vy + 42, g_ubuntu_state_msg, 10.5, cAmber, NO);
+        draw_text(vx + 14, vy + 72, "Click [POPOUT] on title bar for direct native input.", 10.5, cWhite, NO);
+    }
+
+    char ufoot[128];
+    snprintf(ufoot, sizeof(ufoot), "[F5] Boot | FR:%s | KC:%d", g_ubuntu_fr_name, g_last_kc);
+    draw_text(w->x + 12, w->y + w->h - 16, ufoot, 10, cDim, NO);
 }
 
 static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
-    NSColor *cCyan  = [NSColor colorWithRed:0.25 green:0.90 blue:0.95 alpha:1.0];
-    NSColor *cGreen = [NSColor colorWithRed:0.30 green:0.95 blue:0.55 alpha:1.0];
-    NSColor *cAmber = [NSColor colorWithRed:1.00 green:0.78 blue:0.25 alpha:1.0];
-    NSColor *cPink  = [NSColor colorWithRed:0.95 green:0.35 blue:0.65 alpha:1.0];
-    NSColor *cWhite = [NSColor colorWithWhite:0.92 alpha:1.0];
-    NSColor *cDim   = [NSColor colorWithWhite:0.58 alpha:1.0];
+    NSColor *cCyan   = [NSColor colorWithRed:0.25 green:0.90 blue:0.95 alpha:1.0];
+    NSColor *cGreen  = [NSColor colorWithRed:0.30 green:0.95 blue:0.55 alpha:1.0];
+    NSColor *cAmber  = [NSColor colorWithRed:1.00 green:0.78 blue:0.25 alpha:1.0];
+    NSColor *cPink   = [NSColor colorWithRed:0.95 green:0.35 blue:0.65 alpha:1.0];
+    NSColor *cOrange = [NSColor colorWithRed:0.98 green:0.48 blue:0.15 alpha:1.0];
+    NSColor *cWhite  = [NSColor colorWithWhite:0.92 alpha:1.0];
+    NSColor *cDim    = [NSColor colorWithWhite:0.58 alpha:1.0];
 
     fill_rect(w->x + 6, w->y + 6, w->w, w->h, 0xFF04060A);
     fill_rect(w->x, w->y, w->w, w->h, w->body_bg);
@@ -1198,7 +1374,7 @@ static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
     CGContextClipToRect(g_ctx, CGRectMake(w->x + 2, w->y + 2, w->w - 4, w->h - 4));
 
     fill_rect(w->x + 10, w->y + 10, 8, 8, is_front ? w->border_col : 0xFF475569);
-    draw_text(w->x + 24, w->y + 6, w->title, 11.5, is_front ? cWhite : cDim, is_front);
+    draw_text(w->x + 24, w->y + 6, w->title, 11, is_front ? cWhite : cDim, is_front);
 
     if (w->id == WIN_LINUX) {
         render_terminal_window(w, &g_vm_term, is_front, cCyan, cGreen);
@@ -1210,6 +1386,8 @@ static void render_spatial_window(SpatialWindow *w, BOOL is_front) {
         render_ai_hud_window(w, cCyan, cGreen, cAmber, cWhite, cDim);
     } else if (w->id == WIN_BROWSER) {
         render_browser_window(w, is_front, cPink, cAmber, cWhite, cDim);
+    } else if (w->id == WIN_UBUNTU) {
+        render_ubuntu_window(w, cOrange, cAmber, cWhite, cDim);
     }
 
     int gx = w->x + w->w - 14;
@@ -1246,7 +1424,7 @@ static void render_frame(void) {
     fill_rect(0, FB_H - 24, FB_W, 24, 0xFF0F172A);
     fill_rect(0, FB_H - 24, FB_W, 1, 0xFF1E293B);
     draw_text(14, FB_H - 20, g_status, 11, cGreen, YES);
-    draw_text(700, FB_H - 20, "[F1] Win | [F3] Shared | [F8] AL Goal | [F11] Auto | [F12] Rollback", 10.5, cCyan, NO);
+    draw_text(690, FB_H - 20, "[F1] Win | [F3] Shared | [F5] Ubuntu | [F8] AL Goal | [F10] Reset", 10.5, cCyan, NO);
 
     [NSGraphicsContext setCurrentContext:prevCtx];
     pthread_mutex_unlock(&g_lock);
@@ -1262,6 +1440,53 @@ static void render_frame(void) {
 
 @implementation ZeroView
 - (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)toggleUbuntuPopout {
+#if defined(__arm64__)
+    if (!g_ubuntuView) return;
+    if (!g_ubuntu_popout) {
+        g_ubuntu_popout = 1;
+        [g_ubuntuView removeFromSuperview];
+        [g_ubuntuView setHidden:NO];
+        if (!g_ubuntuPopoutWin) {
+            g_ubuntuPopoutWin = [[NSWindow alloc]
+                initWithContentRect:NSMakeRect(160, 120, 1024, 768)
+                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+                            backing:NSBackingStoreBuffered
+                              defer:NO];
+            [g_ubuntuPopoutWin setTitle:@"ZERO OS — Ubuntu Virtio-GPU (Direct Input)"];
+            [g_ubuntuPopoutWin setReleasedWhenClosed:NO];
+            [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification
+                                                              object:g_ubuntuPopoutWin
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification *note) {
+                if (g_ubuntu_popout) {
+                    g_ubuntu_popout = 0;
+                    [g_ubuntuView removeFromSuperview];
+                    g_ubuntuView.autoresizingMask = NSViewNotSizable;
+                    [self addSubview:g_ubuntuView];
+                    [self syncSpatialOverlays];
+                }
+            }];
+        }
+        [g_ubuntuView setFrame:g_ubuntuPopoutWin.contentView.bounds];
+        g_ubuntuView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [g_ubuntuPopoutWin.contentView addSubview:g_ubuntuView];
+        [g_ubuntuPopoutWin makeKeyAndOrderFront:nil];
+        [g_ubuntuPopoutWin makeFirstResponder:g_ubuntuView];
+        [NSApp activateIgnoringOtherApps:YES];
+        snprintf(g_status, sizeof(g_status), "UBUNTU POPPED OUT (DIRECT INPUT) — CLOSE WINDOW OR CLICK [DOCK] TO RETURN");
+    } else {
+        g_ubuntu_popout = 0;
+        [g_ubuntuPopoutWin orderOut:nil];
+        [g_ubuntuView removeFromSuperview];
+        g_ubuntuView.autoresizingMask = NSViewNotSizable;
+        [self addSubview:g_ubuntuView];
+        [self syncSpatialOverlays];
+        snprintf(g_status, sizeof(g_status), "UBUNTU DOCKED BACK INTO 6-WINDOW SPATIAL COMPOSITOR");
+    }
+#endif
+}
 
 - (void)captureBrowserSnapshot {
     if (!g_webView || g_webView.isHidden) return;
@@ -1292,35 +1517,64 @@ static void render_frame(void) {
     }];
 }
 
-- (void)syncWebViewOverlay {
-    if (!g_webView) return;
-    pthread_mutex_lock(&g_lock);
-    SpatialWindow bw = g_wins[WIN_BROWSER];
-    BOOL occluded = is_browser_occluded();
-    BOOL dragging = (_dragMode == 1 || _dragMode == 2);
-    if (g_webView.URL) {
-        const char *cur = [[g_webView.URL absoluteString] UTF8String];
-        if (cur && cur[0]) strncpy(g_browser_url, cur, sizeof(g_browser_url) - 1);
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    if (occluded || dragging) {
-        if (!g_webView.isHidden) [g_webView setHidden:YES];
-        return;
-    }
-
+- (void)syncSpatialOverlays {
     CGFloat scaleX = self.bounds.size.width / (CGFloat)FB_W;
     CGFloat scaleY = self.bounds.size.height / (CGFloat)FB_H;
-    CGFloat vx = (bw.x + 4) * scaleX;
-    CGFloat vy = (FB_H - (bw.y + bw.h - 18)) * scaleY;
-    CGFloat vw = MAX(40, (bw.w - 8) * scaleX);
-    CGFloat vh = MAX(40, (bw.h - 74) * scaleY);
 
-    NSRect targetFrame = NSMakeRect(vx, vy, vw, vh);
-    if (!NSEqualRects(g_webView.frame, targetFrame)) {
-        [g_webView setFrame:targetFrame];
+    if (g_webView) {
+        pthread_mutex_lock(&g_lock);
+        SpatialWindow bw = g_wins[WIN_BROWSER];
+        BOOL occluded = is_window_occluded(WIN_BROWSER);
+        BOOL dragging = (_dragMode == 1 || _dragMode == 2);
+        if (g_webView.URL) {
+            const char *cur = [[g_webView.URL absoluteString] UTF8String];
+            if (cur && cur[0]) strncpy(g_browser_url, cur, sizeof(g_browser_url) - 1);
+        }
+        pthread_mutex_unlock(&g_lock);
+
+        if (occluded || dragging) {
+            if (!g_webView.isHidden) [g_webView setHidden:YES];
+        } else {
+            CGFloat vx = (bw.x + 4) * scaleX;
+            CGFloat vy = (FB_H - (bw.y + bw.h - 18)) * scaleY;
+            CGFloat vw = MAX(40, (bw.w - 8) * scaleX);
+            CGFloat vh = MAX(40, (bw.h - 74) * scaleY);
+            NSRect targetFrame = NSMakeRect(vx, vy, vw, vh);
+            if (!NSEqualRects(g_webView.frame, targetFrame)) [g_webView setFrame:targetFrame];
+            if (g_webView.isHidden) [g_webView setHidden:NO];
+        }
     }
-    if (g_webView.isHidden) [g_webView setHidden:NO];
+
+#if defined(__arm64__)
+    {
+        NSWindow *kw = [NSApp keyWindow] ?: self.window;
+        NSResponder *fr = kw.firstResponder;
+        const char *cls = fr ? [NSStringFromClass([fr class]) UTF8String] : "none";
+        pthread_mutex_lock(&g_lock);
+        snprintf(g_ubuntu_fr_name, sizeof(g_ubuntu_fr_name), "%.36s", cls ?: "none");
+        pthread_mutex_unlock(&g_lock);
+    }
+    if (g_ubuntuView && !g_ubuntu_popout) {
+        pthread_mutex_lock(&g_lock);
+        SpatialWindow uw = g_wins[WIN_UBUNTU];
+        BOOL uOccluded = is_window_occluded(WIN_UBUNTU);
+        BOOL dragging = (_dragMode == 1 || _dragMode == 2);
+        BOOL running = (g_ubuntu_running != 0);
+        pthread_mutex_unlock(&g_lock);
+
+        if (!running || uOccluded || dragging) {
+            if (!g_ubuntuView.isHidden) [g_ubuntuView setHidden:YES];
+        } else {
+            CGFloat vx = (uw.x + 4) * scaleX;
+            CGFloat vy = (FB_H - (uw.y + uw.h - 20)) * scaleY;
+            CGFloat vw = MAX(40, (uw.w - 8) * scaleX);
+            CGFloat vh = MAX(40, (uw.h - 52) * scaleY);
+            NSRect targetFrame = NSMakeRect(vx, vy, vw, vh);
+            if (!NSEqualRects(g_ubuntuView.frame, targetFrame)) [g_ubuntuView setFrame:targetFrame];
+            if (g_ubuntuView.isHidden) [g_ubuntuView setHidden:NO];
+        }
+    }
+#endif
 
     g_snap_tick++;
     if (g_snap_tick % 30 == 0) {
@@ -1376,8 +1630,8 @@ static void render_frame(void) {
 
 - (void)updateAiScrollFromY:(CGFloat)fy {
     SpatialWindow *w = &g_wins[WIN_AI_HUD];
-    int by = w->y + 98;
-    int bh = MAX(80, w->h - 114);
+    int by = w->y + 94;
+    int bh = MAX(80, w->h - 110);
     int vis_rows = MAX(2, (bh - 44) / 16);
     int max_scroll = MAX(0, g_ai_total_lines - vis_rows);
     int ty = by + 24;
@@ -1426,6 +1680,14 @@ static void render_frame(void) {
             return;
         }
 
+                if (wid == WIN_UBUNTU &&
+            fx >= w->x + w->w - 80 && fx <= w->x + w->w - 8 &&
+            fy >= w->y + 4 && fy <= w->y + 24) {
+            pthread_mutex_unlock(&g_lock);
+            [self toggleUbuntuPopout];
+            return;
+        }
+
         if (fy <= w->y + 28) {
             [self captureBrowserSnapshot];
             _dragMode = 1;
@@ -1445,6 +1707,19 @@ static void render_frame(void) {
             _origW = w->w;
             _origH = w->h;
             pthread_mutex_unlock(&g_lock);
+            return;
+        }
+
+        if (wid == WIN_UBUNTU) {
+            g_ai_input_mode = 0;
+            g_url_input_mode = 0;
+            pthread_mutex_unlock(&g_lock);
+            [self syncSpatialOverlays];
+#if defined(__arm64__)
+            if (g_ubuntu_running && g_ubuntuView && !g_ubuntuView.isHidden) {
+                [self.window makeFirstResponder:g_ubuntuView];
+            }
+#endif
             return;
         }
 
@@ -1478,7 +1753,7 @@ static void render_frame(void) {
         }
 
         if (wid == WIN_AI_HUD) {
-            int by = w->y + 98;
+            int by = w->y + 94;
             if (fy >= by) {
                 if (fx >= w->x + w->w - 32) {
                     _dragMode = 3;
@@ -1528,11 +1803,12 @@ static void render_frame(void) {
 }
 
 - (void)mouseUp:(NSEvent *)event {
-    BOOL wasBrowserResize = (_dragMode == 2 && _dragWinId == WIN_BROWSER);
+    int finishedWin = _dragWinId;
+    int finishedMode = _dragMode;
     _dragMode = 0;
     _dragWinId = -1;
-    if (wasBrowserResize) {
-        [self syncWebViewOverlay];
+    if (finishedMode == 2 && (finishedWin == WIN_BROWSER || finishedWin == WIN_UBUNTU)) {
+        [self syncSpatialOverlays];
         [self captureBrowserSnapshot];
     }
 }
@@ -1553,7 +1829,7 @@ static void render_frame(void) {
         else tb->scroll_back = MAX(0, tb->scroll_back - 2);
     } else if (wid == WIN_AI_HUD) {
         SpatialWindow *w = &g_wins[WIN_AI_HUD];
-        int bh = MAX(80, w->h - 114);
+        int bh = MAX(80, w->h - 110);
         int vis_rows = MAX(2, (bh - 44) / 16);
         int max_scroll = MAX(0, g_ai_total_lines - vis_rows);
         if (dy < 0) g_ai_scroll = MIN(max_scroll, g_ai_scroll + 1);
@@ -1628,6 +1904,15 @@ static void render_frame(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
+- (void)keyUp:(NSEvent *)event {
+#if defined(__arm64__)
+    if (front_window_id() == WIN_UBUNTU && !g_url_input_mode && !g_ai_input_mode &&
+        g_ubuntu_running && g_ubuntuView) {
+        
+    }
+#endif
+}
+
 - (void)keyDown:(NSEvent *)event {
     unsigned short kc = [event keyCode];
     NSString *chars = [event characters];
@@ -1692,7 +1977,11 @@ static void render_frame(void) {
         return;
     }
     if (kc == 118) { boot_native_linux_kernel(); return; }                  // F4
-    if (kc == 96)  { fetch_live_web_image(); return; }                      // F5
+    if (kc == 96)  {                                                        // F5 -> Boot Ubuntu GUI
+        bring_window_to_front(WIN_UBUNTU);
+        boot_ubuntu_desktop_gui();
+        return;
+    }
     if (kc == 97)  { save_atom_snapshot_file("state.atom", NO); return; }   // F6
     if (kc == 98)  { restore_atom_snapshot_file("state.atom"); return; }    // F7
     if (kc == 100 || (kc == 53 && g_ai_input_mode)) {                       // F8 or Esc
@@ -1707,7 +1996,7 @@ static void render_frame(void) {
     if (kc == 109) {                                                        // F10
         pthread_mutex_lock(&g_lock);
         reset_spatial_layout();
-        snprintf(g_status, sizeof(g_status), "RESET 5 SPATIAL WINDOWS TO DEFAULT MULTI-OS LAYOUT");
+        snprintf(g_status, sizeof(g_status), "RESET 6 SPATIAL WINDOWS TO DEFAULT MULTI-OS LAYOUT");
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -1722,6 +2011,18 @@ static void render_frame(void) {
         pthread_mutex_lock(&g_lock);
         restore_atom_snapshot_file("zero_auto.atom");
         pthread_mutex_unlock(&g_lock);
+        return;
+    }
+
+    if (front_window_id() == WIN_UBUNTU && !g_url_input_mode && !g_ai_input_mode) {
+#if defined(__arm64__)
+        if (g_ubuntu_running && g_ubuntuView) {
+            if (self.window.firstResponder != g_ubuntuView) {
+                [self.window makeFirstResponder:g_ubuntuView];
+            }
+            
+        }
+#endif
         return;
     }
 
@@ -1809,10 +2110,10 @@ int main(int argc, const char *argv[]) {
         fetch_live_web_image();
 
         NSRect scr = [[NSScreen mainScreen] visibleFrame];
-        CGFloat winW = MIN(FB_W, scr.size.width * 0.92);
+        CGFloat winW = MIN(FB_W, scr.size.width * 0.94);
         CGFloat winH = winW * ((CGFloat)FB_H / (CGFloat)FB_W);
-        if (winH > scr.size.height * 0.90) {
-            winH = scr.size.height * 0.90;
+        if (winH > scr.size.height * 0.92) {
+            winH = scr.size.height * 0.92;
             winW = winH * ((CGFloat)FB_W / (CGFloat)FB_H);
         }
 
@@ -1821,24 +2122,37 @@ int main(int argc, const char *argv[]) {
                                                     styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
-        [win setTitle:@"ZERO OS v0.7.0 — Closed-Loop AL Agent & WebKit DOM Perception"];
+        [win setTitle:@"ZERO OS v0.8.0-dev — 6-Window Multi-OS Compositor + Ubuntu Virtio-GPU"];
         ZeroView *view = [[ZeroView alloc] initWithFrame:NSMakeRect(0, 0, winW, winH)];
         [win setContentView:view];
 
         WKWebViewConfiguration *wcfg = [[WKWebViewConfiguration alloc] init];
-        g_webView = [[WKWebView alloc] initWithFrame:NSMakeRect(600, 380, 650, 320) configuration:wcfg];
+        g_webView = [[WKWebView alloc] initWithFrame:NSMakeRect(880, 380, 380, 320) configuration:wcfg];
         g_webView.navigationDelegate = view;
         [view addSubview:g_webView];
         navigate_browser_to(g_browser_url);
+
+#if defined(__arm64__)
+        g_ubuntuView = [[VZVirtualMachineView alloc] initWithFrame:NSMakeRect(430, 380, 430, 320)];
+        g_ubuntuView.capturesSystemKeys = NO;
+        [g_ubuntuView setHidden:YES];
+        [view addSubview:g_ubuntuView];
+#endif
+
+        boot_ubuntu_desktop_gui();
 
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
         [NSTimer scheduledTimerWithTimeInterval:(1.0 / 30.0) repeats:YES block:^(NSTimer *t) {
-            [view syncWebViewOverlay];
+            [view syncSpatialOverlays];
             [view setNeedsDisplay:YES];
         }];
 
+        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *ev) {
+            g_last_kc = (int)[ev keyCode];
+            return ev;
+        }];
         [NSApp run];
     }
     return 0;
